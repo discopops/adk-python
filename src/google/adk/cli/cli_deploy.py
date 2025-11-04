@@ -888,9 +888,9 @@ def to_agent_engine(
     agent_config['entrypoint_module'] = f'{temp_folder}.{adk_app}'
     agent_config['entrypoint_object'] = 'adk_app'
     agent_config['source_packages'] = [temp_folder]
+    agent_config['class_methods'] = _AGENT_ENGINE_CLASS_METHODS
 
     if not agent_engine_id:
-      agent_config['class_methods'] = _AGENT_ENGINE_CLASS_METHODS
       agent_config['agent_framework'] = 'google-adk'
       agent_engine = client.agent_engines.create(config=agent_config)
       click.secho(
