@@ -16,23 +16,23 @@ agentic architectures that range from simple tasks to complex workflows.
 
 ### Key Components
 
--   **Agent** - Blueprint defining identity, instructions, and tools
-    (`LlmAgent`, `LoopAgent`, `ParallelAgent`, `SequentialAgent`, etc.)
--   **Runner** - Execution engine that orchestrates agent execution. It manages
-    the 'Reason-Act' loop, processes messages within a session, generates
-    events, calls LLMs, executes tools, and handles multi-agent coordination. It
-    interacts with various services like session management, artifact storage,
-    and memory, and integrates with application-wide plugins. The runner
-    provides different execution modes: `run_async` for asynchronous execution
-    in production, `run_live` for bi-directional streaming interaction, and
-    `run` for synchronous execution suitable for local testing and debugging. At
-    the end of each invocation, it can perform event compaction to manage
-    session history size.
--   **Tool** - Functions/capabilities agents can call (Python functions, OpenAPI
-    specs, MCP tools, Google API tools)
--   **Session** - Conversation state management (in-memory, Vertex AI,
-    Spanner-backed)
--   **Memory** - Long-term recall across sessions
+- **Agent** - Blueprint defining identity, instructions, and tools
+  (`LlmAgent`, `LoopAgent`, `ParallelAgent`, `SequentialAgent`, etc.)
+- **Runner** - Execution engine that orchestrates agent execution. It manages
+  the 'Reason-Act' loop, processes messages within a session, generates
+  events, calls LLMs, executes tools, and handles multi-agent coordination. It
+  interacts with various services like session management, artifact storage,
+  and memory, and integrates with application-wide plugins. The runner
+  provides different execution modes: `run_async` for asynchronous execution
+  in production, `run_live` for bi-directional streaming interaction, and
+  `run` for synchronous execution suitable for local testing and debugging. At
+  the end of each invocation, it can perform event compaction to manage
+  session history size.
+- **Tool** - Functions/capabilities agents can call (Python functions, OpenAPI
+  specs, MCP tools, Google API tools)
+- **Session** - Conversation state management (in-memory, Vertex AI,
+  Spanner-backed)
+- **Memory** - Long-term recall across sessions
 
 ### How the Runner Works
 
@@ -45,30 +45,30 @@ like `SessionService`, `ArtifactService`, and `MemoryService` for persistence.
 Each call to `runner.run_async()` or `runner.run()` processes a single user
 turn, known as an **invocation**.
 
-1.  **Session Retrieval:** When `run_async()` is called with a `session_id`, the
-    runner fetches the session state, including all conversation events, from
-    the `SessionService`.
-2.  **Context Creation:** It creates an `InvocationContext` containing the
-    session, the new user message, and references to persistence services.
-3.  **Agent Execution:** The runner calls `agent.run_async()` with this context.
-    The agent then enters its reason-act loop, which may involve:
-    *   Calling an LLM for reasoning.
-    *   Executing tools (function calling).
-    *   Generating text or audio responses.
-    *   Transferring control to sub-agents.
-4.  **Event Streaming & Persistence:** Each step in the agent's execution (LLM
-    call, tool call, tool response, model response) generates `Event` objects.
-    The runner streams these events back to the caller and simultaneously
-    appends them to the session via `SessionService`.
-5.  **Invocation Completion:** Once the agent has produced its final response
-    for the turn (e.g., a text response to the user), the agent's execution loop
-    finishes.
-6.  **Event Compaction:** If event compaction is configured, the runner may
-    summarize older events in the session to manage context window limits,
-    appending a `CompactedEvent` to the session.
-7.  **Next Turn:** When the user sends another message, a new `run_async()`
-    invocation begins, repeating the cycle by loading the session, which now
-    includes the events from all prior turns.
+1. **Session Retrieval:** When `run_async()` is called with a `session_id`, the
+   runner fetches the session state, including all conversation events, from
+   the `SessionService`.
+2. **Context Creation:** It creates an `InvocationContext` containing the
+   session, the new user message, and references to persistence services.
+3. **Agent Execution:** The runner calls `agent.run_async()` with this context.
+   The agent then enters its reason-act loop, which may involve:
+   * Calling an LLM for reasoning.
+   * Executing tools (function calling).
+   * Generating text or audio responses.
+   * Transferring control to sub-agents.
+4. **Event Streaming & Persistence:** Each step in the agent's execution (LLM
+   call, tool call, tool response, model response) generates `Event` objects.
+   The runner streams these events back to the caller and simultaneously
+   appends them to the session via `SessionService`.
+5. **Invocation Completion:** Once the agent has produced its final response
+   for the turn (e.g., a text response to the user), the agent's execution loop
+   finishes.
+6. **Event Compaction:** If event compaction is configured, the runner may
+   summarize older events in the session to manage context window limits,
+   appending a `CompactedEvent` to the session.
+7. **Next Turn:** When the user sends another message, a new `run_async()`
+   invocation begins, repeating the cycle by loading the session, which now
+   includes the events from all prior turns.
 
 ## Project Architecture
 
@@ -114,32 +114,30 @@ tests/
 
 ### ADK Live (Bidi-streaming)
 
--   ADK live feature can be accessed from runner.run_live(...) and corresponding
-    FAST api endpoint.
--   ADK live feature is built on top of
-    [Gemini Live API](https://cloud.google.com/vertex-ai/generative-ai/docs/live-api).
-    We integrate Gemini Live API through
-    [GenAI SDK](https://github.com/googleapis/python-genai).
--   ADK live related configs are in
-    [run_config.py](https://github.com/google/adk-python/blob/main/src/google/adk/agents/run_config.py).
--   ADK live under multi-agent scenario: we convert the audio into text. This
-    text will be passed to next agent as context.
--   Most logics are in
-    [base_llm_flow.py](https://github.com/google/adk-python/blob/main/src/google/adk/flows/llm_flows/base_llm_flow.py)
-    and
-    [gemini_llm_connection.py](https://github.com/google/adk-python/blob/main/src/google/adk/models/gemini_llm_connection.py).
--   Input transcription and output transcription should be added to session as
-    Event.
--   User audio or model audio should be saved into artifacts with a reference in
-    Event to it.
--   Tests are in
-    [tests/unittests/streaming](https://github.com/google/adk-python/tree/main/tests/unittests/streaming).
+- ADK live feature can be accessed from runner.run_live(...) and corresponding
+  FAST api endpoint.
+- ADK live feature is built on top of
+  [Gemini Live API](https://cloud.google.com/vertex-ai/generative-ai/docs/live-api).
+  We integrate Gemini Live API through
+  [GenAI SDK](https://github.com/googleapis/python-genai).
+- ADK live related configs are in
+  [run_config.py](https://github.com/google/adk-python/blob/main/src/google/adk/agents/run_config.py).
+- ADK live under multi-agent scenario: we convert the audio into text. This
+  text will be passed to next agent as context.
+- Most logics are in
+  [base_llm_flow.py](https://github.com/google/adk-python/blob/main/src/google/adk/flows/llm_flows/base_llm_flow.py)
+  and
+  [gemini_llm_connection.py](https://github.com/google/adk-python/blob/main/src/google/adk/models/gemini_llm_connection.py).
+- Input transcription and output transcription should be added to session as
+  Event.
+- User audio or model audio should be saved into artifacts with a reference in
+  Event to it.
+- Tests are in
+  [tests/unittests/streaming](https://github.com/google/adk-python/tree/main/tests/unittests/streaming).
 
 ### Agent Structure Convention (Required)
 
-**All agent directories must follow this structure:** `my_agent/ ├──
-__init__.py # MUST contain: from . import agent └── agent.py # MUST define:
-root_agent = Agent(...) OR app = App(...)`
+**All agent directories must follow this structure:** `my_agent/ ├── __init__.py # MUST contain: from . import agent └── agent.py # MUST define: root_agent = Agent(...) OR app = App(...)`
 
 **Choose one pattern based on your needs:**
 
@@ -172,8 +170,7 @@ automatically discover and load agents without additional configuration.
 - Python 3.10+ (**Python 3.11+ strongly recommended** for best performance)
 - `uv` package manager (**required** - faster than pip/venv)
 
-**Install uv if not already installed:** `bash curl -LsSf
-https://astral.sh/uv/install.sh | sh`
+**Install uv if not already installed:** `bash curl -LsSf https://astral.sh/uv/install.sh | sh`
 
 ### Setup Instructions
 
@@ -187,8 +184,7 @@ uv venv --python "python3.11" ".venv" source .venv/bin/activate
 
 uv sync --all-extras ```
 
-**Minimal setup for testing only (matches CI):** `bash uv sync --extra test
---extra eval --extra a2a`
+**Minimal setup for testing only (matches CI):** `bash uv sync --extra test --extra eval --extra a2a`
 
 **Virtual Environment Usage (Required):** - **Always use** `.venv/bin/python` or
 `.venv/bin/pytest` directly - **Or activate** with `source .venv/bin/activate`
@@ -242,17 +238,17 @@ The project follows the Google Python Style Guide. Key conventions are enforced
 using `pylint` with the provided `pylintrc` configuration file. Here are some of
 the key style points:
 
-*   **Indentation**: 2 spaces.
-*   **Line Length**: Maximum 80 characters.
-*   **Naming Conventions**:
-    *   `function_and_variable_names`: `snake_case`
-    *   `ClassNames`: `CamelCase`
-    *   `CONSTANTS`: `UPPERCASE_SNAKE_CASE`
-*   **Docstrings**: Required for all public modules, functions, classes, and
-    methods.
-*   **Imports**: Organized and sorted.
-*   **Error Handling**: Specific exceptions should be caught, not general ones
-    like `Exception`.
+* **Indentation**: 2 spaces.
+* **Line Length**: Maximum 80 characters.
+* **Naming Conventions**:
+  * `function_and_variable_names`: `snake_case`
+  * `ClassNames`: `CamelCase`
+  * `CONSTANTS`: `UPPERCASE_SNAKE_CASE`
+* **Docstrings**: Required for all public modules, functions, classes, and
+  methods.
+* **Imports**: Organized and sorted.
+* **Error Handling**: Specific exceptions should be caught, not general ones
+  like `Exception`.
 
 ### Autoformat (Required Before Committing)
 
@@ -268,8 +264,7 @@ isort src/ tests/ contributing/
 
 pyink --config pyproject.toml src/ tests/ contributing/ ```
 
-**Check formatting** without making changes: `bash pyink --check --diff --config
-pyproject.toml src/ isort --check src/`
+**Check formatting** without making changes: `bash pyink --check --diff --config pyproject.toml src/ isort --check src/`
 
 **Formatting Standards (Enforced by CI):** - **Formatter:** `pyink`
 (Google-style Python formatter) - **Line length:** 80 characters maximum -
@@ -362,8 +357,7 @@ catching issues with the public API.
 
 **Quick start:** Run all tests with: `bash pytest tests/unittests`
 
-**Recommended:** Match CI configuration before submitting PRs: `bash uv sync
---extra test --extra eval --extra a2a && pytest tests/unittests`
+**Recommended:** Match CI configuration before submitting PRs: `bash uv sync --extra test --extra eval --extra a2a && pytest tests/unittests`
 
 **Additional options:** ```bash
 
@@ -595,3 +589,4 @@ Quick reference to important project files:
 *   **Converting Exceptions to Strings:** `str(e)` can be uninformative. `repr(e)` is often better. For full details including tracebacks and chained exceptions, use functions from the `traceback` module (e.g., `traceback.format_exception(e)`, `traceback.format_exc()`).
 *   **Terminating Programs:** Use `sys.exit()` for expected terminations. Uncaught non-`SystemExit` exceptions should signal bugs. Avoid functions that cause immediate, unclean exits like `os.abort()`.
 *   **Returning None:** Be consistent. If a function can return a value, all paths should return a value (use `return None` explicitly). Bare `return` is only for early exit in conceptually void functions (annotated with `-> None`).
+```
