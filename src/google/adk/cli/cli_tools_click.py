@@ -712,8 +712,11 @@ def cli_eval(
   logs.setup_adk_logger(getattr(logging, log_level.upper()))
 
   try:
+    import importlib
+
     from ..evaluation.base_eval_service import InferenceConfig
     from ..evaluation.base_eval_service import InferenceRequest
+    from ..evaluation.custom_metric_evaluator import _CustomMetricEvaluator
     from ..evaluation.eval_config import get_eval_metrics_from_config
     from ..evaluation.eval_config import get_evaluation_criteria_or_default
     from ..evaluation.eval_result import EvalCaseResult
@@ -723,9 +726,11 @@ def cli_eval(
     from ..evaluation.local_eval_set_results_manager import LocalEvalSetResultsManager
     from ..evaluation.local_eval_sets_manager import load_eval_set_from_file
     from ..evaluation.local_eval_sets_manager import LocalEvalSetsManager
+    from ..evaluation.metric_evaluator_registry import DEFAULT_METRIC_EVALUATOR_REGISTRY
     from ..evaluation.simulation.user_simulator_provider import UserSimulatorProvider
     from .cli_eval import _collect_eval_results
     from .cli_eval import _collect_inferences
+    from .cli_eval import get_default_metric_info
     from .cli_eval import get_root_agent
     from .cli_eval import parse_and_get_evals_to_run
     from .cli_eval import pretty_print_eval_result
@@ -818,11 +823,30 @@ def cli_eval(
   )
 
   try:
+    metric_evaluator_registry = DEFAULT_METRIC_EVALUATOR_REGISTRY
+    if eval_config.custom_metrics:
+      for (
+          metric_name,
+          config,
+      ) in eval_config.custom_metrics.items():
+        if config.metric_info:
+          metric_info = config.metric_info.model_copy()
+          metric_info.metric_name = metric_name
+        else:
+          metric_info = get_default_metric_info(
+              metric_name=metric_name, description=config.description
+          )
+
+        metric_evaluator_registry.register_evaluator(
+            metric_info, _CustomMetricEvaluator
+        )
+
     eval_service = LocalEvalService(
         root_agent=root_agent,
         eval_sets_manager=eval_sets_manager,
         eval_set_results_manager=eval_set_results_manager,
         user_simulator_provider=user_simulator_provider,
+        metric_evaluator_registry=metric_evaluator_registry,
     )
 
     inference_results = asyncio.run(
@@ -1029,6 +1053,19 @@ def web_options():
     return wrapper
 
   return decorator
+
+
+def _deprecate_staging_bucket(ctx, param, value):
+  if value:
+    click.echo(
+        click.style(
+            f"WARNING: --{param} is deprecated and will be removed. Please"
+            " leave it unspecified.",
+            fg="yellow",
+        ),
+        err=True,
+    )
+  return value
 
 
 def deprecated_adk_services_options():
@@ -1689,10 +1726,8 @@ def cli_migrate_session(
     "--staging_bucket",
     type=str,
     default=None,
-    help=(
-        "Optional. GCS bucket for staging the deployment artifacts. It will be"
-        " ignored if api_key is set."
-    ),
+    help="Deprecated. This argument is no longer required or used.",
+    callback=_deprecate_staging_bucket,
 )
 @click.option(
     "--agent_engine_id",
@@ -1827,8 +1862,7 @@ def cli_deploy_agent_engine(
 
     # With Google Cloud Project and Region
     adk deploy agent_engine --project=[project] --region=[region]
-      --staging_bucket=[staging_bucket] --display_name=[app_name]
-      my_agent
+      --display_name=[app_name] my_agent
   """
   logging.getLogger("vertexai_genai.agentengines").setLevel(logging.INFO)
   try:
@@ -1836,7 +1870,6 @@ def cli_deploy_agent_engine(
         agent_folder=agent,
         project=project,
         region=region,
-        staging_bucket=staging_bucket,
         agent_engine_id=agent_engine_id,
         trace_to_cloud=trace_to_cloud,
         api_key=api_key,
