@@ -16,23 +16,23 @@ agentic architectures that range from simple tasks to complex workflows.
 
 ### Key Components
 
-- **Agent** - Blueprint defining identity, instructions, and tools
-  (`LlmAgent`, `LoopAgent`, `ParallelAgent`, `SequentialAgent`, etc.)
-- **Runner** - Execution engine that orchestrates agent execution. It manages
-  the 'Reason-Act' loop, processes messages within a session, generates
-  events, calls LLMs, executes tools, and handles multi-agent coordination. It
-  interacts with various services like session management, artifact storage,
-  and memory, and integrates with application-wide plugins. The runner
-  provides different execution modes: `run_async` for asynchronous execution
-  in production, `run_live` for bi-directional streaming interaction, and
-  `run` for synchronous execution suitable for local testing and debugging. At
-  the end of each invocation, it can perform event compaction to manage
-  session history size.
-- **Tool** - Functions/capabilities agents can call (Python functions, OpenAPI
-  specs, MCP tools, Google API tools)
-- **Session** - Conversation state management (in-memory, Vertex AI,
-  Spanner-backed)
-- **Memory** - Long-term recall across sessions
+-   **Agent** - Blueprint defining identity, instructions, and tools
+    (`LlmAgent`, `LoopAgent`, `ParallelAgent`, `SequentialAgent`, etc.)
+-   **Runner** - Execution engine that orchestrates agent execution. It manages
+    the 'Reason-Act' loop, processes messages within a session, generates
+    events, calls LLMs, executes tools, and handles multi-agent coordination. It
+    interacts with various services like session management, artifact storage,
+    and memory, and integrates with application-wide plugins. The runner
+    provides different execution modes: `run_async` for asynchronous execution
+    in production, `run_live` for bidirectional streaming interaction, and
+    `run` for synchronous execution suitable for local testing and debugging. At
+    the end of each invocation, it can perform event compaction to manage
+    session history size.
+-   **Tool** - Functions/capabilities agents can call (Python functions, OpenAPI
+    specs, MCP tools, Google API tools)
+-   **Session** - Conversation state management (in-memory, Vertex AI,
+    Spanner-backed)
+-   **Memory** - Long-term recall across sessions
 
 ### How the Runner Works
 
@@ -311,7 +311,7 @@ navigation and refactoring.
 immediately after the license header, before any other imports.
 
 ```python
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
