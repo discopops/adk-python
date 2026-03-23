@@ -61,6 +61,12 @@ class PrebuiltMetrics(Enum):
 
   PER_TURN_USER_SIMULATOR_QUALITY_V1 = "per_turn_user_simulator_quality_v1"
 
+  MULTI_TURN_TASK_SUCCESS_V1 = "multi_turn_task_success_v1"
+
+  MULTI_TURN_TRAJECTORY_QUALITY_V1 = "multi_turn_trajectory_quality_v1"
+
+  MULTI_TURN_TOOL_USE_QUALITY_V1 = "multi_turn_tool_use_quality_v1"
+
 
 MetricName: TypeAlias = Union[str, PrebuiltMetrics]
 Threshold: TypeAlias = float
@@ -189,7 +195,7 @@ class ToolTrajectoryCriterion(BaseCriterion):
       Actual tool calls: [T1, T1.1, T2, T2.1, T2.2, T3, T3.1]
 
       While the tool calls T1, T2 and T3 happened in the "Actual" and in
-      the same order as "Expected", but the the tool calls T4 is missing.
+      the same order as "Expected", but the tool calls T4 is missing.
     """
 
     ANY_ORDER = 2
@@ -215,7 +221,7 @@ class ToolTrajectoryCriterion(BaseCriterion):
       Actual tool calls: [T1, T1.1, T2, T2.1, T2.2, T3, T3.1]
 
       While the tool calls T1, T2 and T3 happened in the "Actual" and in
-      the same order as "Expected", but the the tool calls T4 is missing.
+      the same order as "Expected", but the tool calls T4 is missing.
     """
 
   match_type: MatchType = Field(

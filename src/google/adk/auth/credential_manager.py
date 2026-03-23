@@ -24,6 +24,7 @@ from ..tools.openapi_tool.auth.credential_exchangers.service_account_exchanger i
 from ..utils.feature_decorator import experimental
 from .auth_credential import AuthCredential
 from .auth_credential import AuthCredentialTypes
+from .auth_provider_registry import AuthProviderRegistry
 from .auth_schemes import AuthSchemeType
 from .auth_schemes import ExtendedOAuth2
 from .auth_schemes import OpenIdConnectWithConfig
@@ -81,6 +82,7 @@ class CredentialManager:
       auth_config: AuthConfig,
   ):
     self._auth_config = auth_config
+    self._auth_provider_registry = AuthProviderRegistry()
     self._exchanger_registry = CredentialExchangerRegistry()
     self._refresher_registry = CredentialRefresherRegistry()
     self._discovery_manager = OAuth2DiscoveryManager()
@@ -137,12 +139,37 @@ class CredentialManager:
   ) -> Optional[AuthCredential]:
     """Load and prepare authentication credential through a structured workflow."""
 
+    # First, check if a registered auth provider is available before attempting
+    # to retrieve tokens natively.
+    provider = self._auth_provider_registry.get_provider(
+        self._auth_config.auth_scheme
+    )
+    if provider:
+      provided_credential = await provider.get_auth_credential(
+          self._auth_config, context
+      )
+      if not provided_credential:
+        raise ValueError("AuthProvider did not return a credential.")
+      # Handle special case for OAuth2 user consent flow.
+      if (
+          provided_credential.oauth2
+          and not provided_credential.oauth2.access_token
+          and provided_credential.oauth2.auth_uri
+      ):
+        # User consent is required. We save the auth uri and return None
+        # to signal the need for user consent.
+        self._auth_config.exchanged_auth_credential = provided_credential
+        return None
+      return provided_credential
+
     # Step 1: Validate credential configuration
     await self._validate_credential()
 
     # Step 2: Check if credential is already ready (no processing needed)
     if self._is_credential_ready():
-      return self._auth_config.raw_auth_credential
+      # Return a copy to avoid leaking mutations across invocations/users when
+      # tools share a long-lived AuthConfig instance.
+      return self._auth_config.raw_auth_credential.model_copy(deep=True)
 
     # Step 3: Try to load existing processed credential
     credential = await self._load_existing_credential(context)
@@ -159,7 +186,9 @@ class CredentialManager:
     if not credential:
       # For client credentials flow, use raw credentials directly
       if self._is_client_credentials_flow():
-        credential = self._auth_config.raw_auth_credential
+        # Exchange/refresh steps may mutate the credential object in-place, so
+        # do not operate on the shared tool config.
+        credential = self._auth_config.raw_auth_credential.model_copy(deep=True)
       else:
         # For authorization code flow, return None to trigger user authorization
         return None
@@ -298,12 +327,11 @@ class CredentialManager:
       self, context: CallbackContext, credential: AuthCredential
   ) -> None:
     """Save credential to credential service if available."""
-    # Update the exchanged credential in config
-    self._auth_config.exchanged_auth_credential = credential
-
     credential_service = context._invocation_context.credential_service
     if credential_service:
-      await context.save_credential(self._auth_config)
+      auth_config_to_save = self._auth_config.model_copy(deep=True)
+      auth_config_to_save.exchanged_auth_credential = credential
+      await context.save_credential(auth_config_to_save)
 
   async def _populate_auth_scheme(self) -> bool:
     """Auto-discover server metadata and populate missing auth scheme info.

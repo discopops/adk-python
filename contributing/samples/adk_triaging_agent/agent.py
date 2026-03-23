@@ -26,15 +26,14 @@ from google.adk.agents.llm_agent import Agent
 import requests
 
 LABEL_TO_OWNER = {
-    "a2a": "seanzhou1023",
     "agent engine": "yeesian",
-    "auth": "seanzhou1023",
+    "auth": "xuanyang15",
     "bq": "shobsi",
     "core": "Jacksunwei",
     "documentation": "joefernandez",
     "eval": "ankursharmas",
-    "live": "seanzhou1023",
-    "mcp": "seanzhou1023",
+    "live": "wuliang229",
+    "mcp": "wukath",
     "models": "xuanyang15",
     "services": "DeanChensj",
     "tools": "xuanyang15",
@@ -230,7 +229,7 @@ def change_issue_type(issue_number: int, issue_type: str) -> dict[str, Any]:
     issue_type: issue type to assign
 
   Returns:
-    The the status of this request, with the applied issue type when successful.
+    The status of this request, with the applied issue type when successful.
   """
   print(
       f"Attempting to change issue type '{issue_type}' to issue #{issue_number}"
