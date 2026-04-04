@@ -13,21 +13,22 @@
 # limitations under the License.
 
 import sys
-import warnings
 
 from google.adk.integrations.secret_manager import secret_client
 import pytest
 
 
 def test_secret_client_module_deprecation():
-  """Verifies that importing from clients.secret_client triggers a warning."""
-  module_to_test = "google.adk.tools.apihub_tool.clients.secret_client"
-  if module_to_test in sys.modules:
-    sys.modules.pop(module_to_test)
+    """Verifies that importing from clients.secret_client triggers a warning."""
+    module_to_test = "google.adk.tools.apihub_tool.clients.secret_client"
+    if module_to_test in sys.modules:
+        sys.modules.pop(module_to_test)
 
-  with pytest.warns(
-      DeprecationWarning, match="google.adk.integrations.secret_manager"
-  ):
-    from google.adk.tools.apihub_tool.clients.secret_client import SecretManagerClient as deprecated_secret_client
+    with pytest.warns(
+        DeprecationWarning, match="google.adk.integrations.secret_manager"
+    ):
+        from google.adk.tools.apihub_tool.clients.secret_client import (
+            SecretManagerClient as deprecated_secret_client,
+        )
 
-  assert deprecated_secret_client is secret_client.SecretManagerClient
+    assert deprecated_secret_client is secret_client.SecretManagerClient

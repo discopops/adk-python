@@ -33,17 +33,19 @@ registry = AgentRegistry(project_id=project_id, location=location)
 print(f"Listing agents in {project_id}/{location}...")
 agents = registry.list_agents()
 for agent in agents.get("agents", []):
-  print(f"- Agent: {agent.get('displayName')} ({agent.get('name')})")
+    print(f"- Agent: {agent.get('displayName')} ({agent.get('name')})")
 
 print(f"\nListing MCP servers in {project_id}/{location}...")
 mcp_servers = registry.list_mcp_servers()
 for server in mcp_servers.get("mcpServers", []):
-  print(f"- MCP Server: {server.get('displayName')} ({server.get('name')})")
+    print(f"- MCP Server: {server.get('displayName')} ({server.get('name')})")
 
 print(f"\nListing endpoints in {project_id}/{location}...")
 endpoints = registry.list_endpoints()
 for endpoint in endpoints.get("endpoints", []):
-  print(f"- Endpoint: {endpoint.get('displayName')} ({endpoint.get('name')})")
+    print(
+        f"- Endpoint: {endpoint.get('displayName')} ({endpoint.get('name')})"
+    )
 
 # Example of using a specific agent or MCP server from the registry:
 # (Note: These names should be full resource names as returned by list methods)

@@ -17,13 +17,17 @@ from __future__ import annotations
 import warnings
 
 try:
-  from google.adk.integrations.secret_manager.secret_client import SecretManagerClient
+    from google.adk.integrations.secret_manager.secret_client import (
+        SecretManagerClient,
+    )
 
-  warnings.warn(
-      "SecretManagerClient has been moved to"
-      " google.adk.integrations.secret_manager. Please update your imports.",
-      DeprecationWarning,
-      stacklevel=2,
-  )
+    warnings.warn(
+        "SecretManagerClient has been moved to"
+        " google.adk.integrations.secret_manager. Please update your imports.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 except ImportError:
-  pass
+    pass
+
+__all__ = ["SecretManagerClient"]

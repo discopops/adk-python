@@ -15,7 +15,6 @@
 import base64
 import json
 import os
-import sys
 from unittest import mock
 from unittest.mock import AsyncMock
 from unittest.mock import MagicMock
@@ -31,7 +30,6 @@ from google.adk.models.anthropic_llm import part_to_message_block
 from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.genai import types
-from google.genai import version as genai_version
 from google.genai.types import Content
 from google.genai.types import Part
 import pytest
@@ -39,104 +37,109 @@ import pytest
 
 @pytest.fixture
 def generate_content_response():
-  return anthropic_types.Message(
-      id="msg_vrtx_testid",
-      content=[
-          anthropic_types.TextBlock(
-              citations=None, text="Hi! How can I help you today?", type="text"
-          )
-      ],
-      model="claude-3-5-sonnet-v2-20241022",
-      role="assistant",
-      stop_reason="end_turn",
-      stop_sequence=None,
-      type="message",
-      usage=anthropic_types.Usage(
-          cache_creation_input_tokens=0,
-          cache_read_input_tokens=0,
-          input_tokens=13,
-          output_tokens=12,
-          server_tool_use=None,
-          service_tier=None,
-      ),
-  )
+    return anthropic_types.Message(
+        id="msg_vrtx_testid",
+        content=[
+            anthropic_types.TextBlock(
+                citations=None,
+                text="Hi! How can I help you today?",
+                type="text",
+            )
+        ],
+        model="claude-3-5-sonnet-v2-20241022",
+        role="assistant",
+        stop_reason="end_turn",
+        stop_sequence=None,
+        type="message",
+        usage=anthropic_types.Usage(
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            input_tokens=13,
+            output_tokens=12,
+            server_tool_use=None,
+            service_tier=None,
+        ),
+    )
 
 
 @pytest.fixture
 def generate_llm_response():
-  return LlmResponse.create(
-      types.GenerateContentResponse(
-          candidates=[
-              types.Candidate(
-                  content=Content(
-                      role="model",
-                      parts=[Part.from_text(text="Hello, how can I help you?")],
-                  ),
-                  finish_reason=types.FinishReason.STOP,
-              )
-          ]
-      )
-  )
+    return LlmResponse.create(
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    content=Content(
+                        role="model",
+                        parts=[
+                            Part.from_text(text="Hello, how can I help you?")
+                        ],
+                    ),
+                    finish_reason=types.FinishReason.STOP,
+                )
+            ]
+        )
+    )
 
 
 @pytest.fixture
 def claude_llm():
-  return Claude(model="claude-3-5-sonnet-v2@20241022")
+    return Claude(model="claude-3-5-sonnet-v2@20241022")
 
 
 @pytest.fixture
 def llm_request():
-  return LlmRequest(
-      model="claude-3-5-sonnet-v2@20241022",
-      contents=[Content(role="user", parts=[Part.from_text(text="Hello")])],
-      config=types.GenerateContentConfig(
-          temperature=0.1,
-          response_modalities=[types.Modality.TEXT],
-          system_instruction="You are a helpful assistant",
-      ),
-  )
+    return LlmRequest(
+        model="claude-3-5-sonnet-v2@20241022",
+        contents=[Content(role="user", parts=[Part.from_text(text="Hello")])],
+        config=types.GenerateContentConfig(
+            temperature=0.1,
+            response_modalities=[types.Modality.TEXT],
+            system_instruction="You are a helpful assistant",
+        ),
+    )
 
 
 def test_claude_anthropic_client_creation():
-  # Test with environment variables
-  with mock.patch.dict(
-      os.environ,
-      {
-          "GOOGLE_CLOUD_PROJECT": "env-project",
-          "GOOGLE_CLOUD_LOCATION": "env-location",
-      },
-  ):
-    model = Claude(model="claude-3-5-sonnet-v2@20241022")
-    with mock.patch(
-        "google.adk.models.anthropic_llm.AsyncAnthropicVertex", autospec=True
-    ) as mock_client_class:
-      _ = model._anthropic_client
-      mock_client_class.assert_called_once()
-      _, kwargs = mock_client_class.call_args
-      assert kwargs["project_id"] == "env-project"
-      assert kwargs["region"] == "env-location"
+    # Test with environment variables
+    with mock.patch.dict(
+        os.environ,
+        {
+            "GOOGLE_CLOUD_PROJECT": "env-project",
+            "GOOGLE_CLOUD_LOCATION": "env-location",
+        },
+    ):
+        model = Claude(model="claude-3-5-sonnet-v2@20241022")
+        with mock.patch(
+            "google.adk.models.anthropic_llm.AsyncAnthropicVertex",
+            autospec=True,
+        ) as mock_client_class:
+            _ = model._anthropic_client
+            mock_client_class.assert_called_once()
+            _, kwargs = mock_client_class.call_args
+            assert kwargs["project_id"] == "env-project"
+            assert kwargs["region"] == "env-location"
 
 
 def test_claude_anthropic_client_creation_with_full_resource_name():
-  # Test with full resource name in model string
-  model = Claude(
-      model="projects/test-project/locations/test-location/publishers/anthropic/models/claude-3-5-sonnet-v2@20241022"
-  )
-  with mock.patch(
-      "google.adk.models.anthropic_llm.AsyncAnthropicVertex", autospec=True
-  ) as mock_client_class:
-    _ = model._anthropic_client
-    mock_client_class.assert_called_once()
-    _, kwargs = mock_client_class.call_args
-    assert kwargs["project_id"] == "test-project"
-    assert kwargs["region"] == "test-location"
+    # Test with full resource name in model string
+    model = Claude(
+        model="projects/test-project/locations/test-location/publishers/anthropic/models/claude-3-5-sonnet-v2@20241022"
+    )
+    with mock.patch(
+        "google.adk.models.anthropic_llm.AsyncAnthropicVertex", autospec=True
+    ) as mock_client_class:
+        _ = model._anthropic_client
+        mock_client_class.assert_called_once()
+        _, kwargs = mock_client_class.call_args
+        assert kwargs["project_id"] == "test-project"
+        assert kwargs["region"] == "test-location"
 
 
 def test_supported_models():
-  models = Claude.supported_models()
-  assert len(models) == 2
-  assert models[0] == r"claude-3-.*"
-  assert models[1] == r"claude-.*-4.*"
+    models = Claude.supported_models()
+    assert len(models) == 2
+    assert models[0] == r"claude-3-.*"
+    assert models[1] == r"claude-.*-4.*"
 
 
 function_declaration_test_cases = [
@@ -579,235 +582,244 @@ function_declaration_test_cases = [
 async def test_function_declaration_to_tool_param(
     _, function_declaration, expected_tool_param
 ):
-  """Test function_declaration_to_tool_param."""
-  assert (
-      function_declaration_to_tool_param(function_declaration)
-      == expected_tool_param
-  )
+    """Test function_declaration_to_tool_param."""
+    assert (
+        function_declaration_to_tool_param(function_declaration)
+        == expected_tool_param
+    )
 
 
 @pytest.mark.asyncio
 async def test_generate_content_async(
     claude_llm, llm_request, generate_content_response, generate_llm_response
 ):
-  with mock.patch.object(claude_llm, "_anthropic_client") as mock_client:
-    with mock.patch.object(
-        anthropic_llm,
-        "message_to_generate_content_response",
-        return_value=generate_llm_response,
-    ):
-      # Create a mock coroutine that returns the generate_content_response.
-      async def mock_coro():
-        return generate_content_response
+    with mock.patch.object(claude_llm, "_anthropic_client") as mock_client:
+        with mock.patch.object(
+            anthropic_llm,
+            "message_to_generate_content_response",
+            return_value=generate_llm_response,
+        ):
+            # Create a mock coroutine that returns the generate_content_response.
+            async def mock_coro():
+                return generate_content_response
 
-      # Assign the coroutine to the mocked method
-      mock_client.messages.create.return_value = mock_coro()
+            # Assign the coroutine to the mocked method
+            mock_client.messages.create.return_value = mock_coro()
 
-      responses = [
-          resp
-          async for resp in claude_llm.generate_content_async(
-              llm_request, stream=False
-          )
-      ]
-      assert len(responses) == 1
-      assert isinstance(responses[0], LlmResponse)
-      assert responses[0].content.parts[0].text == "Hello, how can I help you?"
+            responses = [
+                resp
+                async for resp in claude_llm.generate_content_async(
+                    llm_request, stream=False
+                )
+            ]
+            assert len(responses) == 1
+            assert isinstance(responses[0], LlmResponse)
+            assert (
+                responses[0].content.parts[0].text
+                == "Hello, how can I help you?"
+            )
 
 
 @pytest.mark.asyncio
 async def test_anthropic_llm_generate_content_async(
     llm_request, generate_content_response, generate_llm_response
 ):
-  anthropic_llm_instance = AnthropicLlm(model="claude-sonnet-4-20250514")
-  with mock.patch.object(
-      anthropic_llm_instance, "_anthropic_client"
-  ) as mock_client:
+    anthropic_llm_instance = AnthropicLlm(model="claude-sonnet-4-20250514")
     with mock.patch.object(
-        anthropic_llm,
-        "message_to_generate_content_response",
-        return_value=generate_llm_response,
-    ):
-      # Create a mock coroutine that returns the generate_content_response.
-      async def mock_coro():
-        return generate_content_response
+        anthropic_llm_instance, "_anthropic_client"
+    ) as mock_client:
+        with mock.patch.object(
+            anthropic_llm,
+            "message_to_generate_content_response",
+            return_value=generate_llm_response,
+        ):
+            # Create a mock coroutine that returns the generate_content_response.
+            async def mock_coro():
+                return generate_content_response
 
-      # Assign the coroutine to the mocked method
-      mock_client.messages.create.return_value = mock_coro()
+            # Assign the coroutine to the mocked method
+            mock_client.messages.create.return_value = mock_coro()
 
-      responses = [
-          resp
-          async for resp in anthropic_llm_instance.generate_content_async(
-              llm_request, stream=False
-          )
-      ]
-      assert len(responses) == 1
-      assert isinstance(responses[0], LlmResponse)
-      assert responses[0].content.parts[0].text == "Hello, how can I help you?"
+            responses = [
+                resp
+                async for resp in anthropic_llm_instance.generate_content_async(
+                    llm_request, stream=False
+                )
+            ]
+            assert len(responses) == 1
+            assert isinstance(responses[0], LlmResponse)
+            assert (
+                responses[0].content.parts[0].text
+                == "Hello, how can I help you?"
+            )
 
 
 def test_claude_vertex_client_uses_tracking_headers():
-  """Tests that Claude vertex client is called with tracking headers."""
-  with mock.patch.object(
-      anthropic_llm, "AsyncAnthropicVertex", autospec=True
-  ) as mock_anthropic_vertex:
-    with mock.patch.dict(
-        os.environ,
-        {
-            "GOOGLE_CLOUD_PROJECT": "test-project",
-            "GOOGLE_CLOUD_LOCATION": "us-central1",
-        },
-    ):
-      instance = Claude(model="claude-3-5-sonnet-v2@20241022")
-      _ = instance._anthropic_client
-      mock_anthropic_vertex.assert_called_once()
-      _, kwargs = mock_anthropic_vertex.call_args
-      assert "default_headers" in kwargs
-      assert "x-goog-api-client" in kwargs["default_headers"]
-      assert "user-agent" in kwargs["default_headers"]
-      assert (
-          f"google-adk/{adk_version.__version__}"
-          in kwargs["default_headers"]["user-agent"]
-      )
+    """Tests that Claude vertex client is called with tracking headers."""
+    with mock.patch.object(
+        anthropic_llm, "AsyncAnthropicVertex", autospec=True
+    ) as mock_anthropic_vertex:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "GOOGLE_CLOUD_PROJECT": "test-project",
+                "GOOGLE_CLOUD_LOCATION": "us-central1",
+            },
+        ):
+            instance = Claude(model="claude-3-5-sonnet-v2@20241022")
+            _ = instance._anthropic_client
+            mock_anthropic_vertex.assert_called_once()
+            _, kwargs = mock_anthropic_vertex.call_args
+            assert "default_headers" in kwargs
+            assert "x-goog-api-client" in kwargs["default_headers"]
+            assert "user-agent" in kwargs["default_headers"]
+            assert (
+                f"google-adk/{adk_version.__version__}"
+                in kwargs["default_headers"]["user-agent"]
+            )
 
 
 @pytest.mark.asyncio
 async def test_generate_content_async_with_max_tokens(
     llm_request, generate_content_response, generate_llm_response
 ):
-  claude_llm = Claude(model="claude-3-5-sonnet-v2@20241022", max_tokens=4096)
-  with mock.patch.object(claude_llm, "_anthropic_client") as mock_client:
-    with mock.patch.object(
-        anthropic_llm,
-        "message_to_generate_content_response",
-        return_value=generate_llm_response,
-    ):
-      # Create a mock coroutine that returns the generate_content_response.
-      async def mock_coro():
-        return generate_content_response
+    claude_llm = Claude(model="claude-3-5-sonnet-v2@20241022", max_tokens=4096)
+    with mock.patch.object(claude_llm, "_anthropic_client") as mock_client:
+        with mock.patch.object(
+            anthropic_llm,
+            "message_to_generate_content_response",
+            return_value=generate_llm_response,
+        ):
+            # Create a mock coroutine that returns the generate_content_response.
+            async def mock_coro():
+                return generate_content_response
 
-      # Assign the coroutine to the mocked method
-      mock_client.messages.create.return_value = mock_coro()
+            # Assign the coroutine to the mocked method
+            mock_client.messages.create.return_value = mock_coro()
 
-      _ = [
-          resp
-          async for resp in claude_llm.generate_content_async(
-              llm_request, stream=False
-          )
-      ]
-      mock_client.messages.create.assert_called_once()
-      _, kwargs = mock_client.messages.create.call_args
-      assert kwargs["max_tokens"] == 4096
+            _ = [
+                resp
+                async for resp in claude_llm.generate_content_async(
+                    llm_request, stream=False
+                )
+            ]
+            mock_client.messages.create.assert_called_once()
+            _, kwargs = mock_client.messages.create.call_args
+            assert kwargs["max_tokens"] == 4096
 
 
 def test_part_to_message_block_with_content():
-  """Test that part_to_message_block handles content format."""
-  from google.adk.models.anthropic_llm import part_to_message_block
+    """Test that part_to_message_block handles content format."""
+    from google.adk.models.anthropic_llm import part_to_message_block
 
-  # Create a function response part with content array.
-  mcp_response_part = types.Part.from_function_response(
-      name="generate_sample_filesystem",
-      response={
-          "content": [{
-              "type": "text",
-              "text": '{"name":"root","node_type":"folder","children":[]}',
-          }]
-      },
-  )
-  mcp_response_part.function_response.id = "test_id_123"
+    # Create a function response part with content array.
+    mcp_response_part = types.Part.from_function_response(
+        name="generate_sample_filesystem",
+        response={
+            "content": [
+                {
+                    "type": "text",
+                    "text": '{"name":"root","node_type":"folder","children":[]}',
+                }
+            ]
+        },
+    )
+    mcp_response_part.function_response.id = "test_id_123"
 
-  result = part_to_message_block(mcp_response_part)
+    result = part_to_message_block(mcp_response_part)
 
-  # ToolResultBlockParam is a TypedDict.
-  assert isinstance(result, dict)
-  assert result["tool_use_id"] == "test_id_123"
-  assert result["type"] == "tool_result"
-  assert not result["is_error"]
-  # Verify the content was extracted from the content format.
-  assert (
-      '{"name":"root","node_type":"folder","children":[]}' in result["content"]
-  )
+    # ToolResultBlockParam is a TypedDict.
+    assert isinstance(result, dict)
+    assert result["tool_use_id"] == "test_id_123"
+    assert result["type"] == "tool_result"
+    assert not result["is_error"]
+    # Verify the content was extracted from the content format.
+    assert (
+        '{"name":"root","node_type":"folder","children":[]}'
+        in result["content"]
+    )
 
 
 def test_part_to_message_block_with_traditional_result():
-  """Test that part_to_message_block handles traditional result format."""
-  from google.adk.models.anthropic_llm import part_to_message_block
+    """Test that part_to_message_block handles traditional result format."""
+    from google.adk.models.anthropic_llm import part_to_message_block
 
-  # Create a function response part with traditional result format
-  traditional_response_part = types.Part.from_function_response(
-      name="some_tool",
-      response={
-          "result": "This is the result from the tool",
-      },
-  )
-  traditional_response_part.function_response.id = "test_id_456"
+    # Create a function response part with traditional result format
+    traditional_response_part = types.Part.from_function_response(
+        name="some_tool",
+        response={
+            "result": "This is the result from the tool",
+        },
+    )
+    traditional_response_part.function_response.id = "test_id_456"
 
-  result = part_to_message_block(traditional_response_part)
+    result = part_to_message_block(traditional_response_part)
 
-  # ToolResultBlockParam is a TypedDict.
-  assert isinstance(result, dict)
-  assert result["tool_use_id"] == "test_id_456"
-  assert result["type"] == "tool_result"
-  assert not result["is_error"]
-  # Verify the content was extracted from the traditional format
-  assert "This is the result from the tool" in result["content"]
+    # ToolResultBlockParam is a TypedDict.
+    assert isinstance(result, dict)
+    assert result["tool_use_id"] == "test_id_456"
+    assert result["type"] == "tool_result"
+    assert not result["is_error"]
+    # Verify the content was extracted from the traditional format
+    assert "This is the result from the tool" in result["content"]
 
 
 def test_part_to_message_block_with_multiple_content_items():
-  """Test content with multiple items."""
-  from google.adk.models.anthropic_llm import part_to_message_block
+    """Test content with multiple items."""
+    from google.adk.models.anthropic_llm import part_to_message_block
 
-  # Create a function response with multiple content items
-  multi_content_part = types.Part.from_function_response(
-      name="multi_response_tool",
-      response={
-          "content": [
-              {"type": "text", "text": "First part"},
-              {"type": "text", "text": "Second part"},
-          ]
-      },
-  )
-  multi_content_part.function_response.id = "test_id_789"
+    # Create a function response with multiple content items
+    multi_content_part = types.Part.from_function_response(
+        name="multi_response_tool",
+        response={
+            "content": [
+                {"type": "text", "text": "First part"},
+                {"type": "text", "text": "Second part"},
+            ]
+        },
+    )
+    multi_content_part.function_response.id = "test_id_789"
 
-  result = part_to_message_block(multi_content_part)
+    result = part_to_message_block(multi_content_part)
 
-  # ToolResultBlockParam is a TypedDict.
-  assert isinstance(result, dict)
-  # Multiple text items should be joined with newlines
-  assert result["content"] == "First part\nSecond part"
+    # ToolResultBlockParam is a TypedDict.
+    assert isinstance(result, dict)
+    # Multiple text items should be joined with newlines
+    assert result["content"] == "First part\nSecond part"
 
 
 def test_part_to_message_block_with_pdf_document():
-  """Test that part_to_message_block handles PDF document parts."""
-  pdf_data = b"%PDF-1.4 fake pdf content"
-  part = Part(
-      inline_data=types.Blob(mime_type="application/pdf", data=pdf_data)
-  )
+    """Test that part_to_message_block handles PDF document parts."""
+    pdf_data = b"%PDF-1.4 fake pdf content"
+    part = Part(
+        inline_data=types.Blob(mime_type="application/pdf", data=pdf_data)
+    )
 
-  result = part_to_message_block(part)
+    result = part_to_message_block(part)
 
-  assert isinstance(result, dict)
-  assert result["type"] == "document"
-  assert result["source"]["type"] == "base64"
-  assert result["source"]["media_type"] == "application/pdf"
-  assert result["source"]["data"] == base64.b64encode(pdf_data).decode()
+    assert isinstance(result, dict)
+    assert result["type"] == "document"
+    assert result["source"]["type"] == "base64"
+    assert result["source"]["media_type"] == "application/pdf"
+    assert result["source"]["data"] == base64.b64encode(pdf_data).decode()
 
 
 def test_part_to_message_block_with_pdf_mime_type_parameters():
-  """Test that PDF parts with MIME type parameters are handled correctly."""
-  pdf_data = b"%PDF-1.4 fake pdf content"
-  part = Part(
-      inline_data=types.Blob(
-          mime_type="application/pdf; name=doc.pdf", data=pdf_data
-      )
-  )
+    """Test that PDF parts with MIME type parameters are handled correctly."""
+    pdf_data = b"%PDF-1.4 fake pdf content"
+    part = Part(
+        inline_data=types.Blob(
+            mime_type="application/pdf; name=doc.pdf", data=pdf_data
+        )
+    )
 
-  result = part_to_message_block(part)
+    result = part_to_message_block(part)
 
-  assert isinstance(result, dict)
-  assert result["type"] == "document"
-  assert result["source"]["type"] == "base64"
-  assert result["source"]["media_type"] == "application/pdf; name=doc.pdf"
-  assert result["source"]["data"] == base64.b64encode(pdf_data).decode()
+    assert isinstance(result, dict)
+    assert result["type"] == "document"
+    assert result["source"]["type"] == "base64"
+    assert result["source"]["media_type"] == "application/pdf; name=doc.pdf"
+    assert result["source"]["data"] == base64.b64encode(pdf_data).decode()
 
 
 content_to_message_param_test_cases = [
@@ -907,446 +919,466 @@ content_to_message_param_test_cases = [
 def test_content_to_message_param(
     _, content, expected_role, expected_content_length, expected_warning
 ):
-  """Test content_to_message_param handles images and documents based on role."""
-  with mock.patch("google.adk.models.anthropic_llm.logger") as mock_logger:
-    result = content_to_message_param(content)
+    """Test content_to_message_param handles images and documents based on role."""
+    with mock.patch("google.adk.models.anthropic_llm.logger") as mock_logger:
+        result = content_to_message_param(content)
 
-    assert result["role"] == expected_role
-    assert len(result["content"]) == expected_content_length
+        assert result["role"] == expected_role
+        assert len(result["content"]) == expected_content_length
 
-    if expected_warning:
-      mock_logger.warning.assert_called_once_with(expected_warning)
-    else:
-      mock_logger.warning.assert_not_called()
+        if expected_warning:
+            mock_logger.warning.assert_called_once_with(expected_warning)
+        else:
+            mock_logger.warning.assert_not_called()
 
 
 # --- Tests for Bug #2: json.dumps for dict/list function results ---
 
 
 def test_part_to_message_block_dict_result_serialized_as_json():
-  """Dict results should be serialized with json.dumps, not str()."""
-  response_part = types.Part.from_function_response(
-      name="get_topic",
-      response={"result": {"topic": "travel", "active": True, "count": None}},
-  )
-  response_part.function_response.id = "test_id"
+    """Dict results should be serialized with json.dumps, not str()."""
+    response_part = types.Part.from_function_response(
+        name="get_topic",
+        response={
+            "result": {"topic": "travel", "active": True, "count": None}
+        },
+    )
+    response_part.function_response.id = "test_id"
 
-  result = part_to_message_block(response_part)
-  content = result["content"]
+    result = part_to_message_block(response_part)
+    content = result["content"]
 
-  # Must be valid JSON (json.dumps produces "true"/"null", not "True"/"None")
-  parsed = json.loads(content)
-  assert parsed["topic"] == "travel"
-  assert parsed["active"] is True
-  assert parsed["count"] is None
+    # Must be valid JSON (json.dumps produces "true"/"null", not "True"/"None")
+    parsed = json.loads(content)
+    assert parsed["topic"] == "travel"
+    assert parsed["active"] is True
+    assert parsed["count"] is None
 
 
 def test_part_to_message_block_list_result_serialized_as_json():
-  """List results should be serialized with json.dumps."""
-  response_part = types.Part.from_function_response(
-      name="get_items",
-      response={"result": ["item1", "item2", "item3"]},
-  )
-  response_part.function_response.id = "test_id"
+    """List results should be serialized with json.dumps."""
+    response_part = types.Part.from_function_response(
+        name="get_items",
+        response={"result": ["item1", "item2", "item3"]},
+    )
+    response_part.function_response.id = "test_id"
 
-  result = part_to_message_block(response_part)
-  content = result["content"]
+    result = part_to_message_block(response_part)
+    content = result["content"]
 
-  parsed = json.loads(content)
-  assert parsed == ["item1", "item2", "item3"]
+    parsed = json.loads(content)
+    assert parsed == ["item1", "item2", "item3"]
 
 
 def test_part_to_message_block_empty_dict_result_not_dropped():
-  """Empty dict results should produce '{}', not empty string."""
-  response_part = types.Part.from_function_response(
-      name="some_tool",
-      response={"result": {}},
-  )
-  response_part.function_response.id = "test_id"
+    """Empty dict results should produce '{}', not empty string."""
+    response_part = types.Part.from_function_response(
+        name="some_tool",
+        response={"result": {}},
+    )
+    response_part.function_response.id = "test_id"
 
-  result = part_to_message_block(response_part)
-  assert result["content"] == "{}"
+    result = part_to_message_block(response_part)
+    assert result["content"] == "{}"
 
 
 def test_part_to_message_block_empty_list_result_not_dropped():
-  """Empty list results should produce '[]', not empty string."""
-  response_part = types.Part.from_function_response(
-      name="some_tool",
-      response={"result": []},
-  )
-  response_part.function_response.id = "test_id"
+    """Empty list results should produce '[]', not empty string."""
+    response_part = types.Part.from_function_response(
+        name="some_tool",
+        response={"result": []},
+    )
+    response_part.function_response.id = "test_id"
 
-  result = part_to_message_block(response_part)
-  assert result["content"] == "[]"
+    result = part_to_message_block(response_part)
+    assert result["content"] == "[]"
 
 
 def test_part_to_message_block_string_result_unchanged():
-  """String results should still work as before (backward compat)."""
-  response_part = types.Part.from_function_response(
-      name="simple_tool",
-      response={"result": "plain text result"},
-  )
-  response_part.function_response.id = "test_id"
+    """String results should still work as before (backward compat)."""
+    response_part = types.Part.from_function_response(
+        name="simple_tool",
+        response={"result": "plain text result"},
+    )
+    response_part.function_response.id = "test_id"
 
-  result = part_to_message_block(response_part)
-  assert result["content"] == "plain text result"
+    result = part_to_message_block(response_part)
+    assert result["content"] == "plain text result"
 
 
 def test_part_to_message_block_nested_dict_result():
-  """Nested dict with arrays should produce valid JSON."""
-  response_part = types.Part.from_function_response(
-      name="search",
-      response={
-          "result": {
-              "results": [
-                  {"id": 1, "tags": ["a", "b"]},
-                  {"id": 2, "meta": {"key": "val"}},
-              ],
-              "has_more": False,
-          }
-      },
-  )
-  response_part.function_response.id = "test_id"
+    """Nested dict with arrays should produce valid JSON."""
+    response_part = types.Part.from_function_response(
+        name="search",
+        response={
+            "result": {
+                "results": [
+                    {"id": 1, "tags": ["a", "b"]},
+                    {"id": 2, "meta": {"key": "val"}},
+                ],
+                "has_more": False,
+            }
+        },
+    )
+    response_part.function_response.id = "test_id"
 
-  result = part_to_message_block(response_part)
-  parsed = json.loads(result["content"])
-  assert parsed["has_more"] is False
-  assert parsed["results"][0]["tags"] == ["a", "b"]
+    result = part_to_message_block(response_part)
+    parsed = json.loads(result["content"])
+    assert parsed["has_more"] is False
+    assert parsed["results"][0]["tags"] == ["a", "b"]
 
 
 # --- Tests for arbitrary dict fallback (e.g. SkillToolset load_skill) ---
 
 
 def test_part_to_message_block_arbitrary_dict_serialized_as_json():
-  """Dicts with keys other than 'content'/'result' should be JSON-serialized.
+    """Dicts with keys other than 'content'/'result' should be JSON-serialized.
 
-  This covers tools like load_skill that return arbitrary key structures
-  such as {"skill_name": ..., "instructions": ..., "frontmatter": ...}.
-  """
-  response_part = types.Part.from_function_response(
-      name="load_skill",
-      response={
-          "skill_name": "my_skill",
-          "instructions": "Step 1: do this. Step 2: do that.",
-          "frontmatter": {"version": "1.0", "tags": ["a", "b"]},
-      },
-  )
-  response_part.function_response.id = "test_id"
+    This covers tools like load_skill that return arbitrary key structures
+    such as {"skill_name": ..., "instructions": ..., "frontmatter": ...}.
+    """
+    response_part = types.Part.from_function_response(
+        name="load_skill",
+        response={
+            "skill_name": "my_skill",
+            "instructions": "Step 1: do this. Step 2: do that.",
+            "frontmatter": {"version": "1.0", "tags": ["a", "b"]},
+        },
+    )
+    response_part.function_response.id = "test_id"
 
-  result = part_to_message_block(response_part)
+    result = part_to_message_block(response_part)
 
-  assert result["type"] == "tool_result"
-  assert result["tool_use_id"] == "test_id"
-  assert not result["is_error"]
-  parsed = json.loads(result["content"])
-  assert parsed["skill_name"] == "my_skill"
-  assert parsed["instructions"] == "Step 1: do this. Step 2: do that."
-  assert parsed["frontmatter"]["version"] == "1.0"
+    assert result["type"] == "tool_result"
+    assert result["tool_use_id"] == "test_id"
+    assert not result["is_error"]
+    parsed = json.loads(result["content"])
+    assert parsed["skill_name"] == "my_skill"
+    assert parsed["instructions"] == "Step 1: do this. Step 2: do that."
+    assert parsed["frontmatter"]["version"] == "1.0"
 
 
 def test_part_to_message_block_run_skill_script_response():
-  """run_skill_script response keys (stdout/stderr/status) should not be dropped."""
-  response_part = types.Part.from_function_response(
-      name="run_skill_script",
-      response={
-          "skill_name": "my_skill",
-          "script_path": "scripts/setup.py",
-          "stdout": "Done.",
-          "stderr": "",
-          "status": "success",
-      },
-  )
-  response_part.function_response.id = "test_id_2"
+    """run_skill_script response keys (stdout/stderr/status) should not be dropped."""
+    response_part = types.Part.from_function_response(
+        name="run_skill_script",
+        response={
+            "skill_name": "my_skill",
+            "script_path": "scripts/setup.py",
+            "stdout": "Done.",
+            "stderr": "",
+            "status": "success",
+        },
+    )
+    response_part.function_response.id = "test_id_2"
 
-  result = part_to_message_block(response_part)
+    result = part_to_message_block(response_part)
 
-  parsed = json.loads(result["content"])
-  assert parsed["status"] == "success"
-  assert parsed["stdout"] == "Done."
+    parsed = json.loads(result["content"])
+    assert parsed["status"] == "success"
+    assert parsed["stdout"] == "Done."
 
 
 def test_part_to_message_block_error_response_not_dropped():
-  """Error dicts like {"error": ..., "error_code": ...} should be serialized."""
-  response_part = types.Part.from_function_response(
-      name="load_skill",
-      response={
-          "error": "Skill 'missing' not found.",
-          "error_code": "SKILL_NOT_FOUND",
-      },
-  )
-  response_part.function_response.id = "test_id_3"
+    """Error dicts like {"error": ..., "error_code": ...} should be serialized."""
+    response_part = types.Part.from_function_response(
+        name="load_skill",
+        response={
+            "error": "Skill 'missing' not found.",
+            "error_code": "SKILL_NOT_FOUND",
+        },
+    )
+    response_part.function_response.id = "test_id_3"
 
-  result = part_to_message_block(response_part)
+    result = part_to_message_block(response_part)
 
-  parsed = json.loads(result["content"])
-  assert parsed["error_code"] == "SKILL_NOT_FOUND"
+    parsed = json.loads(result["content"])
+    assert parsed["error_code"] == "SKILL_NOT_FOUND"
 
 
 def test_part_to_message_block_empty_response_stays_empty():
-  """An empty response dict should still produce an empty content string."""
-  response_part = types.Part.from_function_response(
-      name="some_tool",
-      response={},
-  )
-  response_part.function_response.id = "test_id_4"
+    """An empty response dict should still produce an empty content string."""
+    response_part = types.Part.from_function_response(
+        name="some_tool",
+        response={},
+    )
+    response_part.function_response.id = "test_id_4"
 
-  result = part_to_message_block(response_part)
+    result = part_to_message_block(response_part)
 
-  assert result["content"] == ""
+    assert result["content"] == ""
 
 
 # --- Tests for Bug #1: Streaming support ---
 
 
 def _make_mock_stream_events(events):
-  """Helper to create an async iterable from a list of events."""
+    """Helper to create an async iterable from a list of events."""
 
-  async def _stream():
-    for event in events:
-      yield event
+    async def _stream():
+        for event in events:
+            yield event
 
-  return _stream()
+    return _stream()
 
 
 @pytest.mark.asyncio
 async def test_streaming_text_yields_partial_and_final():
-  """Streaming text should yield partial chunks then a final response."""
-  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+    """Streaming text should yield partial chunks then a final response."""
+    llm = AnthropicLlm(model="claude-sonnet-4-20250514")
 
-  events = [
-      MagicMock(
-          type="message_start",
-          message=MagicMock(usage=MagicMock(input_tokens=10, output_tokens=0)),
-      ),
-      MagicMock(
-          type="content_block_start",
-          index=0,
-          content_block=anthropic_types.TextBlock(text="", type="text"),
-      ),
-      MagicMock(
-          type="content_block_delta",
-          index=0,
-          delta=anthropic_types.TextDelta(text="Hello ", type="text_delta"),
-      ),
-      MagicMock(
-          type="content_block_delta",
-          index=0,
-          delta=anthropic_types.TextDelta(text="world!", type="text_delta"),
-      ),
-      MagicMock(type="content_block_stop", index=0),
-      MagicMock(
-          type="message_delta",
-          delta=MagicMock(stop_reason="end_turn"),
-          usage=MagicMock(output_tokens=5),
-      ),
-      MagicMock(type="message_stop"),
-  ]
-
-  mock_client = MagicMock()
-  mock_client.messages.create = AsyncMock(
-      return_value=_make_mock_stream_events(events)
-  )
-
-  llm_request = LlmRequest(
-      model="claude-sonnet-4-20250514",
-      contents=[Content(role="user", parts=[Part.from_text(text="Hi")])],
-      config=types.GenerateContentConfig(
-          system_instruction="You are helpful",
-      ),
-  )
-
-  with mock.patch.object(llm, "_anthropic_client", mock_client):
-    responses = [
-        r async for r in llm.generate_content_async(llm_request, stream=True)
+    events = [
+        MagicMock(
+            type="message_start",
+            message=MagicMock(
+                usage=MagicMock(input_tokens=10, output_tokens=0)
+            ),
+        ),
+        MagicMock(
+            type="content_block_start",
+            index=0,
+            content_block=anthropic_types.TextBlock(text="", type="text"),
+        ),
+        MagicMock(
+            type="content_block_delta",
+            index=0,
+            delta=anthropic_types.TextDelta(text="Hello ", type="text_delta"),
+        ),
+        MagicMock(
+            type="content_block_delta",
+            index=0,
+            delta=anthropic_types.TextDelta(text="world!", type="text_delta"),
+        ),
+        MagicMock(type="content_block_stop", index=0),
+        MagicMock(
+            type="message_delta",
+            delta=MagicMock(stop_reason="end_turn"),
+            usage=MagicMock(output_tokens=5),
+        ),
+        MagicMock(type="message_stop"),
     ]
 
-  # 2 partial text chunks + 1 final aggregated
-  assert len(responses) == 3
-  assert responses[0].partial is True
-  assert responses[0].content.parts[0].text == "Hello "
-  assert responses[1].partial is True
-  assert responses[1].content.parts[0].text == "world!"
-  assert responses[2].partial is False
-  assert responses[2].content.parts[0].text == "Hello world!"
-  assert responses[2].usage_metadata.prompt_token_count == 10
-  assert responses[2].usage_metadata.candidates_token_count == 5
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(
+        return_value=_make_mock_stream_events(events)
+    )
+
+    llm_request = LlmRequest(
+        model="claude-sonnet-4-20250514",
+        contents=[Content(role="user", parts=[Part.from_text(text="Hi")])],
+        config=types.GenerateContentConfig(
+            system_instruction="You are helpful",
+        ),
+    )
+
+    with mock.patch.object(llm, "_anthropic_client", mock_client):
+        responses = [
+            r
+            async for r in llm.generate_content_async(llm_request, stream=True)
+        ]
+
+    # 2 partial text chunks + 1 final aggregated
+    assert len(responses) == 3
+    assert responses[0].partial is True
+    assert responses[0].content.parts[0].text == "Hello "
+    assert responses[1].partial is True
+    assert responses[1].content.parts[0].text == "world!"
+    assert responses[2].partial is False
+    assert responses[2].content.parts[0].text == "Hello world!"
+    assert responses[2].usage_metadata.prompt_token_count == 10
+    assert responses[2].usage_metadata.candidates_token_count == 5
 
 
 @pytest.mark.asyncio
 async def test_streaming_tool_use_yields_function_call():
-  """Streaming tool_use should accumulate args and yield in final."""
-  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+    """Streaming tool_use should accumulate args and yield in final."""
+    llm = AnthropicLlm(model="claude-sonnet-4-20250514")
 
-  events = [
-      MagicMock(
-          type="message_start",
-          message=MagicMock(usage=MagicMock(input_tokens=20, output_tokens=0)),
-      ),
-      MagicMock(
-          type="content_block_start",
-          index=0,
-          content_block=anthropic_types.TextBlock(text="", type="text"),
-      ),
-      MagicMock(
-          type="content_block_delta",
-          index=0,
-          delta=anthropic_types.TextDelta(text="Checking.", type="text_delta"),
-      ),
-      MagicMock(type="content_block_stop", index=0),
-      MagicMock(
-          type="content_block_start",
-          index=1,
-          content_block=anthropic_types.ToolUseBlock(
-              id="toolu_abc",
-              name="get_weather",
-              input={},
-              type="tool_use",
-          ),
-      ),
-      MagicMock(
-          type="content_block_delta",
-          index=1,
-          delta=anthropic_types.InputJSONDelta(
-              partial_json='{"city": "Paris"}',
-              type="input_json_delta",
-          ),
-      ),
-      MagicMock(type="content_block_stop", index=1),
-      MagicMock(
-          type="message_delta",
-          delta=MagicMock(stop_reason="tool_use"),
-          usage=MagicMock(output_tokens=12),
-      ),
-      MagicMock(type="message_stop"),
-  ]
-
-  mock_client = MagicMock()
-  mock_client.messages.create = AsyncMock(
-      return_value=_make_mock_stream_events(events)
-  )
-
-  llm_request = LlmRequest(
-      model="claude-sonnet-4-20250514",
-      contents=[
-          Content(
-              role="user",
-              parts=[Part.from_text(text="Weather?")],
-          )
-      ],
-      config=types.GenerateContentConfig(
-          system_instruction="You are helpful",
-      ),
-  )
-
-  with mock.patch.object(llm, "_anthropic_client", mock_client):
-    responses = [
-        r async for r in llm.generate_content_async(llm_request, stream=True)
+    events = [
+        MagicMock(
+            type="message_start",
+            message=MagicMock(
+                usage=MagicMock(input_tokens=20, output_tokens=0)
+            ),
+        ),
+        MagicMock(
+            type="content_block_start",
+            index=0,
+            content_block=anthropic_types.TextBlock(text="", type="text"),
+        ),
+        MagicMock(
+            type="content_block_delta",
+            index=0,
+            delta=anthropic_types.TextDelta(
+                text="Checking.", type="text_delta"
+            ),
+        ),
+        MagicMock(type="content_block_stop", index=0),
+        MagicMock(
+            type="content_block_start",
+            index=1,
+            content_block=anthropic_types.ToolUseBlock(
+                id="toolu_abc",
+                name="get_weather",
+                input={},
+                type="tool_use",
+            ),
+        ),
+        MagicMock(
+            type="content_block_delta",
+            index=1,
+            delta=anthropic_types.InputJSONDelta(
+                partial_json='{"city": "Paris"}',
+                type="input_json_delta",
+            ),
+        ),
+        MagicMock(type="content_block_stop", index=1),
+        MagicMock(
+            type="message_delta",
+            delta=MagicMock(stop_reason="tool_use"),
+            usage=MagicMock(output_tokens=12),
+        ),
+        MagicMock(type="message_stop"),
     ]
 
-  # 1 text partial + 1 final
-  assert len(responses) == 2
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(
+        return_value=_make_mock_stream_events(events)
+    )
 
-  final = responses[-1]
-  assert final.partial is False
-  assert len(final.content.parts) == 2
-  assert final.content.parts[0].text == "Checking."
-  assert final.content.parts[1].function_call.name == "get_weather"
-  assert final.content.parts[1].function_call.args == {"city": "Paris"}
-  assert final.content.parts[1].function_call.id == "toolu_abc"
+    llm_request = LlmRequest(
+        model="claude-sonnet-4-20250514",
+        contents=[
+            Content(
+                role="user",
+                parts=[Part.from_text(text="Weather?")],
+            )
+        ],
+        config=types.GenerateContentConfig(
+            system_instruction="You are helpful",
+        ),
+    )
+
+    with mock.patch.object(llm, "_anthropic_client", mock_client):
+        responses = [
+            r
+            async for r in llm.generate_content_async(llm_request, stream=True)
+        ]
+
+    # 1 text partial + 1 final
+    assert len(responses) == 2
+
+    final = responses[-1]
+    assert final.partial is False
+    assert len(final.content.parts) == 2
+    assert final.content.parts[0].text == "Checking."
+    assert final.content.parts[1].function_call.name == "get_weather"
+    assert final.content.parts[1].function_call.args == {"city": "Paris"}
+    assert final.content.parts[1].function_call.id == "toolu_abc"
 
 
 @pytest.mark.asyncio
 async def test_streaming_passes_stream_true_to_create():
-  """When stream=True, messages.create should be called with stream=True."""
-  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+    """When stream=True, messages.create should be called with stream=True."""
+    llm = AnthropicLlm(model="claude-sonnet-4-20250514")
 
-  events = [
-      MagicMock(
-          type="message_start",
-          message=MagicMock(usage=MagicMock(input_tokens=5, output_tokens=0)),
-      ),
-      MagicMock(
-          type="content_block_start",
-          index=0,
-          content_block=anthropic_types.TextBlock(text="", type="text"),
-      ),
-      MagicMock(
-          type="content_block_delta",
-          index=0,
-          delta=anthropic_types.TextDelta(text="Hi", type="text_delta"),
-      ),
-      MagicMock(type="content_block_stop", index=0),
-      MagicMock(
-          type="message_delta",
-          delta=MagicMock(stop_reason="end_turn"),
-          usage=MagicMock(output_tokens=1),
-      ),
-      MagicMock(type="message_stop"),
-  ]
+    events = [
+        MagicMock(
+            type="message_start",
+            message=MagicMock(
+                usage=MagicMock(input_tokens=5, output_tokens=0)
+            ),
+        ),
+        MagicMock(
+            type="content_block_start",
+            index=0,
+            content_block=anthropic_types.TextBlock(text="", type="text"),
+        ),
+        MagicMock(
+            type="content_block_delta",
+            index=0,
+            delta=anthropic_types.TextDelta(text="Hi", type="text_delta"),
+        ),
+        MagicMock(type="content_block_stop", index=0),
+        MagicMock(
+            type="message_delta",
+            delta=MagicMock(stop_reason="end_turn"),
+            usage=MagicMock(output_tokens=1),
+        ),
+        MagicMock(type="message_stop"),
+    ]
 
-  mock_client = MagicMock()
-  mock_client.messages.create = AsyncMock(
-      return_value=_make_mock_stream_events(events)
-  )
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(
+        return_value=_make_mock_stream_events(events)
+    )
 
-  llm_request = LlmRequest(
-      model="claude-sonnet-4-20250514",
-      contents=[Content(role="user", parts=[Part.from_text(text="Hi")])],
-      config=types.GenerateContentConfig(
-          system_instruction="Test",
-      ),
-  )
+    llm_request = LlmRequest(
+        model="claude-sonnet-4-20250514",
+        contents=[Content(role="user", parts=[Part.from_text(text="Hi")])],
+        config=types.GenerateContentConfig(
+            system_instruction="Test",
+        ),
+    )
 
-  with mock.patch.object(llm, "_anthropic_client", mock_client):
-    _ = [r async for r in llm.generate_content_async(llm_request, stream=True)]
+    with mock.patch.object(llm, "_anthropic_client", mock_client):
+        _ = [
+            r
+            async for r in llm.generate_content_async(llm_request, stream=True)
+        ]
 
-  mock_client.messages.create.assert_called_once()
-  _, kwargs = mock_client.messages.create.call_args
-  assert kwargs["stream"] is True
+    mock_client.messages.create.assert_called_once()
+    _, kwargs = mock_client.messages.create.call_args
+    assert kwargs["stream"] is True
 
 
 @pytest.mark.asyncio
 async def test_non_streaming_does_not_pass_stream_param():
-  """When stream=False, messages.create should NOT get stream param."""
-  llm = AnthropicLlm(model="claude-sonnet-4-20250514")
+    """When stream=False, messages.create should NOT get stream param."""
+    llm = AnthropicLlm(model="claude-sonnet-4-20250514")
 
-  mock_message = anthropic_types.Message(
-      id="msg_test",
-      content=[
-          anthropic_types.TextBlock(text="Hello!", type="text", citations=None)
-      ],
-      model="claude-sonnet-4-20250514",
-      role="assistant",
-      stop_reason="end_turn",
-      stop_sequence=None,
-      type="message",
-      usage=anthropic_types.Usage(
-          input_tokens=5,
-          output_tokens=2,
-          cache_creation_input_tokens=0,
-          cache_read_input_tokens=0,
-          server_tool_use=None,
-          service_tier=None,
-      ),
-  )
+    mock_message = anthropic_types.Message(
+        id="msg_test",
+        content=[
+            anthropic_types.TextBlock(
+                text="Hello!", type="text", citations=None
+            )
+        ],
+        model="claude-sonnet-4-20250514",
+        role="assistant",
+        stop_reason="end_turn",
+        stop_sequence=None,
+        type="message",
+        usage=anthropic_types.Usage(
+            input_tokens=5,
+            output_tokens=2,
+            cache_creation_input_tokens=0,
+            cache_read_input_tokens=0,
+            server_tool_use=None,
+            service_tier=None,
+        ),
+    )
 
-  mock_client = MagicMock()
-  mock_client.messages.create = AsyncMock(return_value=mock_message)
+    mock_client = MagicMock()
+    mock_client.messages.create = AsyncMock(return_value=mock_message)
 
-  llm_request = LlmRequest(
-      model="claude-sonnet-4-20250514",
-      contents=[Content(role="user", parts=[Part.from_text(text="Hi")])],
-      config=types.GenerateContentConfig(
-          system_instruction="Test",
-      ),
-  )
+    llm_request = LlmRequest(
+        model="claude-sonnet-4-20250514",
+        contents=[Content(role="user", parts=[Part.from_text(text="Hi")])],
+        config=types.GenerateContentConfig(
+            system_instruction="Test",
+        ),
+    )
 
-  with mock.patch.object(llm, "_anthropic_client", mock_client):
-    responses = [
-        r async for r in llm.generate_content_async(llm_request, stream=False)
-    ]
+    with mock.patch.object(llm, "_anthropic_client", mock_client):
+        responses = [
+            r
+            async for r in llm.generate_content_async(
+                llm_request, stream=False
+            )
+        ]
 
-  assert len(responses) == 1
-  mock_client.messages.create.assert_called_once()
-  _, kwargs = mock_client.messages.create.call_args
-  assert "stream" not in kwargs
+    assert len(responses) == 1
+    mock_client.messages.create.assert_called_once()
+    _, kwargs = mock_client.messages.create.call_args
+    assert "stream" not in kwargs
