@@ -15,5 +15,5 @@
 from .secret_client import SecretManagerClient
 
 __all__ = [
-    'SecretManagerClient',
+    "SecretManagerClient",
 ]

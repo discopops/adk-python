@@ -17,15 +17,15 @@ from google.adk.agents.llm_agent import Agent
 
 
 def turn_on_lights():
-  """Turn on the lights."""
-  print("turn_on_lights")
-  return {"status": "OK"}
+    """Turn on the lights."""
+    print("turn_on_lights")
+    return {"status": "OK"}
 
 
 def turn_on_tv():
-  """Turn on the tv."""
-  print("turn_on_tv")
-  return {"status": "OK"}
+    """Turn on the tv."""
+    print("turn_on_tv")
+    return {"status": "OK"}
 
 
 root_agent = Agent(

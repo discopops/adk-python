@@ -18,278 +18,195 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import importlib
 import logging
 import os
 import pathlib
 import shlex
 import signal
 from typing import Any
-from typing import Callable
-from typing import cast
 from typing import Optional
-from typing import Protocol
 
 from google.genai import types
 
+from .. import features
 from .base_tool import BaseTool
 from .tool_context import ToolContext
-
-logger = logging.getLogger("google_adk." + __name__)
-
-
-class _ResourceModule(Protocol):
-  RLIMIT_CORE: int
-  RLIMIT_AS: int
-  RLIMIT_FSIZE: int
-  RLIMIT_NPROC: int
-
-  def setrlimit(self, resource: int, limits: tuple[int, int]) -> None:
-    ...
-
-
-def _load_resource_module() -> Optional[_ResourceModule]:
-  try:
-    module = importlib.import_module("resource")
-  except ModuleNotFoundError:
-    return None
-  return cast(_ResourceModule, module)
-
-
-_resource = _load_resource_module()
 
 
 @dataclasses.dataclass(frozen=True)
 class BashToolPolicy:
-  """Configuration for allowed bash commands and resource limits.
+    """Configuration for allowed bash commands based on prefix matching.
 
-  Set allowed_command_prefixes to ("*",) to allow all commands (default),
-  or explicitly list allowed prefixes.
+    Set allowed_command_prefixes to ("*",) to allow all commands (default),
+    or explicitly list allowed prefixes.
+    """
 
-  Values for max_memory_bytes, max_file_size_bytes, and max_child_processes
-  will be enforced upon the spawned subprocess.
-  """
-
-  allowed_command_prefixes: tuple[str, ...] = ("*",)
-  blocked_operators: tuple[str, ...] = ()
-  timeout_seconds: Optional[int] = 30
-  max_memory_bytes: Optional[int] = None
-  max_file_size_bytes: Optional[int] = None
-  max_child_processes: Optional[int] = None
+    allowed_command_prefixes: tuple[str, ...] = ("*",)
 
 
 def _validate_command(command: str, policy: BashToolPolicy) -> Optional[str]:
-  """Validates a bash command against the permitted prefixes."""
-  stripped = command.strip()
-  if not stripped:
-    return "Command is required."
+    """Validates a bash command against the permitted prefixes."""
+    stripped = command.strip()
+    if not stripped:
+        return "Command is required."
 
-  for op in policy.blocked_operators:
-    if op in command:
-      return f"Command contains blocked operator: {op}"
+    if "*" in policy.allowed_command_prefixes:
+        return None
 
-  if "*" in policy.allowed_command_prefixes:
-    return None
+    for prefix in policy.allowed_command_prefixes:
+        if stripped.startswith(prefix):
+            return None
 
-  for prefix in policy.allowed_command_prefixes:
-    if stripped.startswith(prefix):
-      return None
-
-  allowed = ", ".join(policy.allowed_command_prefixes)
-  return f"Command blocked. Permitted prefixes are: {allowed}"
+    allowed = ", ".join(policy.allowed_command_prefixes)
+    return f"Command blocked. Permitted prefixes are: {allowed}"
 
 
-def _set_resource_limits(policy: BashToolPolicy) -> None:
-  """Sets resource limits for the subprocess based on the provided policy."""
-  if _resource is None:
-    return
-  try:
-    _resource.setrlimit(_resource.RLIMIT_CORE, (0, 0))
-    if policy.max_memory_bytes:
-      _resource.setrlimit(
-          _resource.RLIMIT_AS,
-          (policy.max_memory_bytes, policy.max_memory_bytes),
-      )
-    if policy.max_file_size_bytes:
-      _resource.setrlimit(
-          _resource.RLIMIT_FSIZE,
-          (policy.max_file_size_bytes, policy.max_file_size_bytes),
-      )
-    if policy.max_child_processes:
-      _resource.setrlimit(
-          _resource.RLIMIT_NPROC,
-          (policy.max_child_processes, policy.max_child_processes),
-      )
-  except (ValueError, OSError) as e:
-    logger.warning("Failed to set resource limits: %s", e)
-
-
-def _kill_process_group(process: asyncio.subprocess.Process) -> None:
-  """Kills the subprocess group on POSIX and the process elsewhere."""
-  if process.pid is None:
-    return
-  killpg_candidate: object = getattr(os, "killpg", None)
-  sigkill: object = getattr(signal, "SIGKILL", None)
-  if callable(killpg_candidate) and isinstance(sigkill, int):
-    killpg = cast(Callable[[int, int], None], killpg_candidate)
-    killpg(process.pid, sigkill)
-  else:
-    process.kill()
-
-
+@features.experimental(features.FeatureName.SKILL_TOOLSET)
 class ExecuteBashTool(BaseTool):
-  """Tool to execute a validated bash command within a workspace directory."""
+    """Tool to execute a validated bash command within a workspace directory."""
 
-  def __init__(
-      self,
-      *,
-      workspace: pathlib.Path | None = None,
-      policy: Optional[BashToolPolicy] = None,
-  ):
-    if workspace is None:
-      workspace = pathlib.Path.cwd()
-    policy = policy or BashToolPolicy()
-    allowed_hint = (
-        "any command"
-        if "*" in policy.allowed_command_prefixes
-        else (
-            "commands matching prefixes:"
-            f" {', '.join(policy.allowed_command_prefixes)}"
+    def __init__(
+        self,
+        *,
+        workspace: pathlib.Path | None = None,
+        policy: Optional[BashToolPolicy] = None,
+    ):
+        if workspace is None:
+            workspace = pathlib.Path.cwd()
+        policy = policy or BashToolPolicy()
+        allowed_hint = (
+            "any command"
+            if "*" in policy.allowed_command_prefixes
+            else (
+                "commands matching prefixes:"
+                f" {', '.join(policy.allowed_command_prefixes)}"
+            )
         )
-    )
-    super().__init__(
-        name="execute_bash",
-        description=(
-            "Executes a bash command with the working directory set to the"
-            f" workspace. Allowed: {allowed_hint}. All commands require user"
-            " confirmation."
-        ),
-    )
-    self._workspace = workspace
-    self._policy = policy
-
-  def _get_declaration(self) -> Optional[types.FunctionDeclaration]:
-    return types.FunctionDeclaration(
-        name=self.name,
-        description=self.description,
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The bash command to execute.",
-                },
-            },
-            "required": ["command"],
-        },
-    )
-
-  async def run_async(
-      self, *, args: dict[str, Any], tool_context: ToolContext
-  ) -> Any:
-    command = args.get("command")
-    if not isinstance(command, str) or not command:
-      return {"error": "Command is required."}
-
-    # Static validation.
-    error = _validate_command(command, self._policy)
-    if error:
-      return {"error": error}
-
-    # Always request user confirmation.
-    if not tool_context.tool_confirmation:
-      tool_context.request_confirmation(
-          hint=f"Please approve or reject the bash command: {command}",
-      )
-      tool_context.actions.skip_summarization = True
-      return {
-          "error": (
-              "This tool call requires confirmation, please approve or reject."
-          )
-      }
-    elif not tool_context.tool_confirmation.confirmed:
-      return {"error": "This tool call is rejected."}
-
-    if os.name != "posix":
-      return {"error": "ExecuteBashTool is only supported on POSIX systems."}
-
-    stdout = None
-    stderr = None
-    try:
-      process = await asyncio.create_subprocess_exec(
-          *shlex.split(command),
-          cwd=str(self._workspace),
-          stdout=asyncio.subprocess.PIPE,
-          stderr=asyncio.subprocess.PIPE,
-          start_new_session=True,
-          preexec_fn=lambda: _set_resource_limits(self._policy),
-      )
-
-      try:
-        stdout, stderr = await asyncio.wait_for(
-            process.communicate(), timeout=self._policy.timeout_seconds
-        )
-      except asyncio.TimeoutError:
-        try:
-          if process.pid:
-            _kill_process_group(process)
-        except ProcessLookupError:
-          pass
-        stdout, stderr = await process.communicate()
-        return {
-            "error": (
-                f"Command timed out after {self._policy.timeout_seconds}"
-                " seconds."
+        super().__init__(
+            name="execute_bash",
+            description=(
+                "Executes a bash command with the working directory set to the"
+                f" workspace. Allowed: {allowed_hint}. All commands require user"
+                " confirmation."
             ),
-            "stdout": (
+        )
+        self._workspace = workspace
+        self._policy = policy
+
+    def _get_declaration(self) -> Optional[types.FunctionDeclaration]:
+        return types.FunctionDeclaration(
+            name=self.name,
+            description=self.description,
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "The bash command to execute.",
+                    },
+                },
+                "required": ["command"],
+            },
+        )
+
+    async def run_async(
+        self, *, args: dict[str, Any], tool_context: ToolContext
+    ) -> Any:
+        command = args.get("command")
+        if not command:
+            return {"error": "Command is required."}
+
+        # Static validation.
+        error = _validate_command(command, self._policy)
+        if error:
+            return {"error": error}
+
+        # Always request user confirmation.
+        if not tool_context.tool_confirmation:
+            tool_context.request_confirmation(
+                hint=f"Please approve or reject the bash command: {command}",
+            )
+            tool_context.actions.skip_summarization = True
+            return {
+                "error": (
+                    "This tool call requires confirmation, please approve or reject."
+                )
+            }
+        elif not tool_context.tool_confirmation.confirmed:
+            return {"error": "This tool call is rejected."}
+
+        stdout = None
+        stderr = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *shlex.split(command),
+                cwd=str(self._workspace),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+            )
+
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    process.communicate(), timeout=30
+                )
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                stdout, stderr = await process.communicate()
+                return {
+                    "error": "Command timed out after 30 seconds.",
+                    "stdout": (
+                        stdout.decode(errors="replace")
+                        if stdout
+                        else "<no stdout captured>"
+                    ),
+                    "stderr": (
+                        stderr.decode(errors="replace")
+                        if stderr
+                        else "<no stderr captured>"
+                    ),
+                    "returncode": process.returncode,
+                }
+            finally:
+                try:
+                    if process.pid:
+                        os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+            return {
+                "stdout": (
+                    stdout.decode(errors="replace")
+                    if stdout
+                    else "<no stdout captured>"
+                ),
+                "stderr": (
+                    stderr.decode(errors="replace")
+                    if stderr
+                    else "<no stderr captured>"
+                ),
+                "returncode": process.returncode,
+            }
+        except Exception as e:  # pylint: disable=broad-except
+            logger = logging.getLogger("google_adk." + __name__)
+            logger.exception("ExecuteBashTool execution failed")
+
+            stdout_res = (
                 stdout.decode(errors="replace")
                 if stdout
                 else "<no stdout captured>"
-            ),
-            "stderr": (
+            )
+            stderr_res = (
                 stderr.decode(errors="replace")
                 if stderr
                 else "<no stderr captured>"
-            ),
-            "returncode": process.returncode,
-        }
-      finally:
-        try:
-          if process.pid:
-            _kill_process_group(process)
-        except ProcessLookupError:
-          pass
-      return {
-          "stdout": (
-              stdout.decode(errors="replace")
-              if stdout
-              else "<no stdout captured>"
-          ),
-          "stderr": (
-              stderr.decode(errors="replace")
-              if stderr
-              else "<no stderr captured>"
-          ),
-          "returncode": process.returncode,
-      }
-    except Exception as e:  # pylint: disable=broad-except
-      logger.exception("ExecuteBashTool execution failed")
+            )
 
-      stdout_res = (
-          stdout.decode(errors="replace") if stdout else "<no stdout captured>"
-      )
-      stderr_res = (
-          stderr.decode(errors="replace") if stderr else "<no stderr captured>"
-      )
-
-      return {
-          "error": f"Execution failed: {str(e)}",
-          "stdout": stdout_res,
-          "stderr": stderr_res,
-      }
-
-  def _detect_error_in_response(self, response: Any) -> Optional[str]:
-    """Telemetry hook: returns an error type if the response indicates an error."""
-    if isinstance(response, dict) and response.get("error"):
-      return "TOOL_ERROR"
-    return None
+            return {
+                "error": f"Execution failed: {str(e)}",
+                "stdout": stdout_res,
+                "stderr": stderr_res,
+            }

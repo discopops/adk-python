@@ -17,7 +17,9 @@
 import pathlib
 
 from google.adk import Agent
-from google.adk.code_executors.unsafe_local_code_executor import UnsafeLocalCodeExecutor
+from google.adk.code_executors.unsafe_local_code_executor import (
+    UnsafeLocalCodeExecutor,
+)
 from google.adk.skills import load_skill_from_dir
 from google.adk.skills import models
 from google.adk.tools.base_tool import BaseTool
@@ -26,37 +28,37 @@ from google.genai import types
 
 
 class GetTimezoneTool(BaseTool):
-  """A tool to get the timezone for a given location."""
+    """A tool to get the timezone for a given location."""
 
-  def __init__(self):
-    super().__init__(
-        name="get_timezone",
-        description="Returns the timezone for a given location.",
-    )
+    def __init__(self):
+        super().__init__(
+            name="get_timezone",
+            description="Returns the timezone for a given location.",
+        )
 
-  def _get_declaration(self) -> types.FunctionDeclaration | None:
-    return types.FunctionDeclaration(
-        name=self.name,
-        description=self.description,
-        parameters_json_schema={
-            "type": "object",
-            "properties": {
-                "location": {
-                    "type": "string",
-                    "description": "The location to get the timezone for.",
+    def _get_declaration(self) -> types.FunctionDeclaration | None:
+        return types.FunctionDeclaration(
+            name=self.name,
+            description=self.description,
+            parameters_json_schema={
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The location to get the timezone for.",
+                    },
                 },
+                "required": ["location"],
             },
-            "required": ["location"],
-        },
-    )
+        )
 
-  async def run_async(self, *, args: dict, tool_context) -> str:
-    return f"The timezone for {args['location']} is UTC+00:00."
+    async def run_async(self, *, args: dict, tool_context) -> str:
+        return f"The timezone for {args['location']} is UTC+00:00."
 
 
 def get_wind_speed(location: str) -> str:
-  """Returns the current wind speed for a given location."""
-  return f"The wind speed in {location} is 10 mph."
+    """Returns the current wind speed for a given location."""
+    return f"The wind speed in {location} is 10 mph."
 
 
 greeting_skill = models.Skill(
