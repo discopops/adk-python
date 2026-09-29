@@ -29,6 +29,7 @@ from google.adk.agents.base_agent import BaseAgent
 from google.adk.agents.run_config import RunConfig
 from google.adk.apps.app import App
 from google.adk.artifacts.base_artifact_service import ArtifactVersion
+from google.adk.cli import api_server as api_server_module
 from google.adk.cli import fast_api as fast_api_module
 from google.adk.cli.fast_api import get_fast_api_app
 from google.adk.errors.input_validation_error import InputValidationError
@@ -42,13 +43,16 @@ from google.adk.evaluation.in_memory_eval_sets_manager import (
 from google.adk.events.event import Event
 from google.adk.events.event_actions import EventActions
 from google.adk.runners import Runner
-from google.adk.sessions.in_memory_session_service import (
-    InMemorySessionService,
-)
+from google.adk.sessions.in_memory_session_service import InMemorySessionService
 from google.adk.sessions.session import Session
+from google.adk.tools.tool_confirmation import ToolConfirmation
+from google.api_core.exceptions import GoogleAPICallError
+from google.api_core.exceptions import InvalidArgument
 from google.genai import types
 from pydantic import BaseModel
 import pytest
+from starlette.applications import Starlette
+from starlette.routing import Mount
 
 # Configure logging to help diagnose server startup issues
 logging.basicConfig(
@@ -862,6 +866,252 @@ def test_create_session_without_id(test_app, test_session_info):
     logger.info(f"Created session with generated ID: {data['id']}")
 
 
+class _OptionsRecordingSessionService(InMemorySessionService):
+  """In-memory session service that accepts and records arbitrary kwargs."""
+
+  def __init__(self):
+    super().__init__()
+    self.recorded_kwargs: dict[str, Any] = {}
+
+  async def create_session(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      state: Optional[dict[str, Any]] = None,
+      session_id: Optional[str] = None,
+      **kwargs: Any,
+  ) -> Session:
+    self.recorded_kwargs = dict(kwargs)
+    return await super().create_session(
+        app_name=app_name,
+        user_id=user_id,
+        state=state,
+        session_id=session_id,
+    )
+
+
+class _ExplicitOptionsSessionService(InMemorySessionService):
+  """In-memory session service that explicitly accepts custom parameters."""
+
+  def __init__(self):
+    super().__init__()
+    self.recorded_kwargs: dict[str, Any] = {}
+
+  async def create_session(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      state: Optional[dict[str, Any]] = None,
+      session_id: Optional[str] = None,
+      custom_option: Optional[str] = None,
+  ) -> Session:
+    self.recorded_kwargs = {"custom_option": custom_option}
+    return await super().create_session(
+        app_name=app_name,
+        user_id=user_id,
+        state=state,
+        session_id=session_id,
+    )
+
+
+class _ValidatingOptionsSessionService(InMemorySessionService):
+  """In-memory session service that validates options and raises ValueError."""
+
+  async def create_session(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      state: Optional[dict[str, Any]] = None,
+      session_id: Optional[str] = None,
+      **kwargs: Any,
+  ) -> Session:
+    if kwargs.get("ttl") is not None and kwargs.get("expire_time") is not None:
+      raise ValueError(
+          "Cannot specify both 'ttl' and 'expire_time' simultaneously."
+      )
+    return await super().create_session(
+        app_name=app_name,
+        user_id=user_id,
+        state=state,
+        session_id=session_id,
+    )
+
+
+@pytest.fixture
+def explicit_options_session_service():
+  """Create a session service with explicit custom parameters."""
+  return _ExplicitOptionsSessionService()
+
+
+@pytest.fixture
+def explicit_options_test_app(
+    explicit_options_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+):
+  """Create a TestClient backed by an explicit options session service."""
+  return _create_test_client(
+      explicit_options_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+  )
+
+
+@pytest.fixture
+def options_session_service():
+  """Create a session service whose create_session accepts kwargs."""
+  return _OptionsRecordingSessionService()
+
+
+@pytest.fixture
+def options_test_app(
+    options_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+):
+  """Create a TestClient backed by a kwargs-capable session service."""
+  return _create_test_client(
+      options_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+  )
+
+
+@pytest.fixture
+def validating_options_session_service():
+  """Create a session service that validates kwargs."""
+  return _ValidatingOptionsSessionService()
+
+
+@pytest.fixture
+def validating_options_test_app(
+    validating_options_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+):
+  """Create a TestClient backed by a validating session service."""
+  return _create_test_client(
+      validating_options_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+  )
+
+
+def test_create_session_forwards_options(
+    options_test_app, options_session_service, test_session_info
+):
+  """Test that options dict is forwarded to a supporting session service."""
+  url = f"/apps/{test_session_info['app_name']}/users/{test_session_info['user_id']}/sessions"
+  response = options_test_app.post(
+      url,
+      json={
+          "options": {
+              "ttl": "7200s",
+              "expire_time": "2026-08-01T00:00:00Z",
+              "custom_param": "foo",
+          }
+      },
+  )
+
+  assert response.status_code == 200
+  assert options_session_service.recorded_kwargs == {
+      "ttl": "7200s",
+      "expire_time": "2026-08-01T00:00:00Z",
+      "custom_param": "foo",
+  }
+
+
+def test_create_session_explicit_options_forwards_kwargs(
+    explicit_options_test_app,
+    explicit_options_session_service,
+    test_session_info,
+):
+  """Test that options are forwarded to service with explicit parameter."""
+  url = f"/apps/{test_session_info['app_name']}/users/{test_session_info['user_id']}/sessions"
+  response = explicit_options_test_app.post(
+      url, json={"options": {"custom_option": "bar"}}
+  )
+
+  assert response.status_code == 200
+  assert (
+      explicit_options_session_service.recorded_kwargs.get("custom_option")
+      == "bar"
+  )
+
+
+def test_create_session_options_with_unsupported_service(
+    test_app, test_session_info
+):
+  """Test 400 when options are requested but the service cannot honor them."""
+  url = f"/apps/{test_session_info['app_name']}/users/{test_session_info['user_id']}/sessions"
+  response = test_app.post(url, json={"options": {"ttl": "7200s"}})
+
+  assert response.status_code == 400
+  assert "not supported" in response.json()["detail"]
+
+
+def test_create_session_options_validation_error_returns_400(
+    validating_options_test_app, test_session_info
+):
+  """Test 400 when session service raises ValueError on invalid options."""
+  url = f"/apps/{test_session_info['app_name']}/users/{test_session_info['user_id']}/sessions"
+  response = validating_options_test_app.post(
+      url,
+      json={
+          "options": {
+              "ttl": "7200s",
+              "expire_time": "2026-08-01T00:00:00Z",
+          }
+      },
+  )
+
+  assert response.status_code == 400
+  assert (
+      "Cannot specify both 'ttl' and 'expire_time'" in response.json()["detail"]
+  )
+
+
+def test_create_session_options_conflicting_key_returns_400(
+    test_app, test_session_info
+):
+  """Test 400 when options contains a key already bound by the endpoint."""
+  url = f"/apps/{test_session_info['app_name']}/users/{test_session_info['user_id']}/sessions"
+  response = test_app.post(url, json={"options": {"app_name": "other_app"}})
+
+  assert response.status_code == 400
+
+
+def test_accepts_kwargs_rejects_var_positional_parameter():
+  """_accepts_kwargs should return False for variadic positional parameters."""
+  from google.adk.cli.api_server import _accepts_kwargs
+
+  def func(*args: Any) -> None:
+    pass
+
+  assert not _accepts_kwargs(func, {"args": "value"})
+
+
 def test_get_session(test_app, create_test_session):
     """Test retrieving a session by ID."""
     info = create_test_session
@@ -1410,6 +1660,32 @@ def test_list_metrics_info(test_app):
         assert "metricName" in metric
         assert "description" in metric
         assert "metricValueInfo" in metric
+
+
+def test_list_metrics_info_omits_metrics_that_need_no_threshold(
+    builder_test_client,
+):
+  """Always-on informational metrics are not offered for threshold selection.
+
+  This surface asks the user to pick metrics and set a threshold for each, and
+  bounds the threshold control by the metric's value interval. Metrics that
+  need no threshold have neither, so listing them leaves consumers with nothing
+  to render.
+  """
+  response = builder_test_client.get("/dev/apps/test_app/metrics-info")
+
+  assert response.status_code == 200
+  listed = [metric["metricName"] for metric in response.json()["metricsInfo"]]
+  assert "tool_trajectory_avg_score" in listed
+  for informational in (
+      "tool_call_count_v1",
+      "inference_call_count_v1",
+      "token_usage_v1",
+  ):
+    assert informational not in listed
+  # Everything that is listed can be rendered as a bounded threshold control.
+  for metric in response.json()["metricsInfo"]:
+    assert metric["metricValueInfo"]["interval"]
 
 
 def test_debug_trace(test_app):
@@ -2027,9 +2303,298 @@ def test_auto_creates_session(
         assert not any("error" in e for e in sse_events)
 
 
-@pytest.mark.parametrize("endpoint", ["/run", "/run_sse"])
-def test_returns_404_without_auto_create(
-    test_app, test_session_info, monkeypatch, endpoint
+def test_finalize_agent_identity_credentials_invalid_base64(test_app):
+  """Test error handling when user_id_validation_state is invalid Base64."""
+  from google.cloud import iamconnectorcredentials_v1alpha
+
+  with patch.object(
+      iamconnectorcredentials_v1alpha,
+      "IAMConnectorCredentialsServiceClient",
+      autospec=True,
+  ):
+    response = test_app.post(
+        "/agent-identity/finalize",
+        json={
+            "connector_name": "projects/p/locations/l/connectors/c",
+            "user_id": "user-123",
+            "user_id_validation_state": "!!!invalid_base64!!!",
+            "consent_nonce": "nonce-456",
+        },
+    )
+    assert response.status_code == 400
+    assert (
+        "Invalid base64 user_id_validation_state" in response.json()["detail"]
+    )
+
+
+def test_finalize_agent_identity_credentials_missing_dependency(test_app):
+  """Test error handling when google-cloud-iamconnectorcredentials is not installed."""
+  with patch.dict(
+      "sys.modules", {"google.cloud.iamconnectorcredentials_v1alpha": None}
+  ):
+    response = test_app.post(
+        "/agent-identity/finalize",
+        json={
+            "connector_name": "projects/p/locations/l/connectors/c",
+            "user_id": "user-123",
+            "user_id_validation_state": "dGVzdA",
+            "consent_nonce": "nonce-456",
+        },
+    )
+    assert response.status_code == 500
+    assert "Agent Identity support requires" in response.json()["detail"]
+
+
+def test_finalize_agent_identity_credentials_invalid_argument_error(test_app):
+  """Test backend InvalidArgument API error handling (400 response)."""
+  from google.cloud import iamconnectorcredentials_v1alpha
+
+  with patch.object(
+      iamconnectorcredentials_v1alpha,
+      "IAMConnectorCredentialsServiceClient",
+      autospec=True,
+  ) as mock_client_cls:
+    mock_client = mock_client_cls.return_value
+    mock_client.finalize_credentials.side_effect = InvalidArgument(
+        "Invalid consent nonce"
+    )
+
+    response = test_app.post(
+        "/agent-identity/finalize",
+        json={
+            "connector_name": "projects/p/locations/l/connectors/c",
+            "user_id": "user-123",
+            "user_id_validation_state": "dGVzdA",
+            "consent_nonce": "invalid-nonce",
+        },
+    )
+    assert response.status_code == 400
+    assert "Invalid credentials request" in response.json()["detail"]
+
+
+def test_finalize_agent_identity_credentials_api_call_error(test_app):
+  """Test backend GoogleAPICallError error handling with status code propagation."""
+  from google.cloud import iamconnectorcredentials_v1alpha
+
+  err = GoogleAPICallError("Permission denied")
+  err.code = 403
+
+  with patch.object(
+      iamconnectorcredentials_v1alpha,
+      "IAMConnectorCredentialsServiceClient",
+      autospec=True,
+  ) as mock_client_cls:
+    mock_client = mock_client_cls.return_value
+    mock_client.finalize_credentials.side_effect = err
+
+    response = test_app.post(
+        "/agent-identity/finalize",
+        json={
+            "connector_name": "projects/p/locations/l/connectors/c",
+            "user_id": "user-123",
+            "user_id_validation_state": "dGVzdA",
+            "consent_nonce": "nonce-456",
+        },
+    )
+    assert response.status_code == 403
+    assert "Failed to finalize credentials" in response.json()["detail"]
+
+
+#################################################
+# Span Exporter Tests
+#################################################
+
+
+def _readable_span(name, *, trace_id, span_id=1, attributes=None):
+  """Builds a finished span suitable for feeding a SpanExporter."""
+  from opentelemetry.sdk.trace import ReadableSpan
+  from opentelemetry.trace import SpanContext
+
+  return ReadableSpan(
+      name=name,
+      context=SpanContext(trace_id=trace_id, span_id=span_id, is_remote=False),
+      attributes=attributes or {},
+  )
+
+
+def test_api_server_span_exporter_records_only_llm_and_tool_spans():
+  """Only call_llm / send_data / execute_tool* spans are kept, by event id."""
+  from google.adk.cli.api_server import ApiServerSpanExporter
+  from opentelemetry.sdk.trace.export import SpanExportResult
+
+  trace_dict = {}
+  exporter = ApiServerSpanExporter(trace_dict)
+
+  spans = [
+      _readable_span(
+          "call_llm",
+          trace_id=11,
+          span_id=1,
+          attributes={"gcp.vertex.agent.event_id": "llm-event"},
+      ),
+      _readable_span(
+          "send_data",
+          trace_id=12,
+          span_id=2,
+          attributes={"gcp.vertex.agent.event_id": "data-event"},
+      ),
+      _readable_span(
+          "execute_tool my_tool",
+          trace_id=13,
+          span_id=3,
+          attributes={"gcp.vertex.agent.event_id": "tool-event"},
+      ),
+      _readable_span(
+          "invocation",
+          trace_id=14,
+          span_id=4,
+          attributes={"gcp.vertex.agent.event_id": "unrelated-event"},
+      ),
+  ]
+
+  assert exporter.export(spans) == SpanExportResult.SUCCESS
+
+  assert sorted(trace_dict) == ["data-event", "llm-event", "tool-event"]
+  # The exporter augments the span attributes with its trace/span identifiers,
+  # which is what the /debug/trace endpoint hands back to the UI.
+  assert trace_dict["llm-event"]["trace_id"] == 11
+  assert trace_dict["llm-event"]["span_id"] == 1
+  assert trace_dict["tool-event"]["trace_id"] == 13
+
+
+def test_api_server_span_exporter_skips_span_without_event_id():
+  """A traced span carrying no event id cannot be keyed, so it is dropped."""
+  from google.adk.cli.api_server import ApiServerSpanExporter
+
+  trace_dict = {}
+  exporter = ApiServerSpanExporter(trace_dict)
+
+  exporter.export([
+      _readable_span(
+          "call_llm",
+          trace_id=21,
+          attributes={"gcp.vertex.agent.session_id": "session-a"},
+      )
+  ])
+
+  assert trace_dict == {}
+
+
+def test_in_memory_exporter_returns_only_spans_of_requested_session():
+  """Spans are indexed per session id and looked up by trace id."""
+  from google.adk.cli.api_server import InMemoryExporter
+
+  session_trace_dict = {}
+  exporter = InMemoryExporter(session_trace_dict)
+
+  span_a1 = _readable_span(
+      "call_llm",
+      trace_id=101,
+      span_id=1,
+      attributes={"gcp.vertex.agent.session_id": "session-a"},
+  )
+  span_a2 = _readable_span(
+      "execute_tool my_tool",
+      trace_id=101,
+      span_id=2,
+      attributes={"gcp.vertex.agent.session_id": "session-a"},
+  )
+  span_b = _readable_span(
+      "call_llm",
+      trace_id=202,
+      span_id=3,
+      attributes={"gcp.vertex.agent.session_id": "session-b"},
+  )
+
+  exporter.export([span_a1, span_a2, span_b])
+
+  # Both session-a spans share a trace, so the trace id is recorded once.
+  assert session_trace_dict == {"session-a": [101], "session-b": [202]}
+  assert exporter.get_finished_spans("session-a") == [span_a1, span_a2]
+  assert exporter.get_finished_spans("session-b") == [span_b]
+  assert exporter.get_finished_spans("session-never-seen") == []
+
+
+def test_in_memory_exporter_falls_back_to_conversation_id():
+  """A span with no agent session id is indexed by the conversation id."""
+  from google.adk.cli.api_server import InMemoryExporter
+
+  session_trace_dict = {}
+  exporter = InMemoryExporter(session_trace_dict)
+
+  conversation_span = _readable_span(
+      "call_llm",
+      trace_id=303,
+      span_id=1,
+      attributes={"gen_ai.conversation.id": "conversation-1"},
+  )
+  unattributed_span = _readable_span("call_llm", trace_id=404, span_id=2)
+
+  exporter.export([conversation_span, unattributed_span])
+
+  assert session_trace_dict == {"conversation-1": [303]}
+  assert exporter.get_finished_spans("conversation-1") == [conversation_span]
+
+
+def test_in_memory_exporter_clear_drops_spans_but_keeps_session_index():
+  """clear() forgets the spans; the session -> trace id index is untouched."""
+  from google.adk.cli.api_server import InMemoryExporter
+
+  session_trace_dict = {}
+  exporter = InMemoryExporter(session_trace_dict)
+  span = _readable_span(
+      "call_llm",
+      trace_id=505,
+      attributes={"gcp.vertex.agent.session_id": "session-a"},
+  )
+  exporter.export([span])
+  assert exporter.get_finished_spans("session-a") == [span]
+
+  exporter.clear()
+
+  assert exporter.get_finished_spans("session-a") == []
+  assert session_trace_dict == {"session-a": [505]}
+
+
+def test_setup_telemetry_guards_add_span_processor_on_non_sdk_provider(
+    monkeypatch,
+):
+  """A non-SDK TracerProvider lacking add_span_processor does not raise."""
+  from unittest.mock import MagicMock
+
+  from google.adk.cli.api_server import _setup_telemetry
+  from opentelemetry import trace
+
+  non_sdk_provider = MagicMock(spec=trace.TracerProvider)
+  del non_sdk_provider.add_span_processor
+  monkeypatch.setattr(trace, "get_tracer_provider", lambda: non_sdk_provider)
+
+  exporter = MagicMock()
+  _setup_telemetry(otel_to_cloud=False, internal_exporters=[exporter])
+
+
+def test_setup_telemetry_adds_span_processors_when_supported(monkeypatch):
+  """A TracerProvider with add_span_processor registers the internal exporters."""
+  from unittest.mock import MagicMock
+
+  from google.adk.cli.api_server import _setup_telemetry
+  from opentelemetry import trace
+
+  provider = MagicMock()
+  monkeypatch.setattr(trace, "get_tracer_provider", lambda: provider)
+
+  exporter = MagicMock()
+  _setup_telemetry(otel_to_cloud=False, internal_exporters=[exporter])
+  provider.add_span_processor.assert_called_once_with(exporter)
+
+
+#################################################
+# Request-body plumbing tests
+#################################################
+
+
+def test_create_session_applies_body_session_id_state_and_events(
+    test_app, test_session_info
 ):
     """Test /run and /run_sse return 404 for missing sessions without auto_create."""
 
@@ -2048,9 +2613,417 @@ def test_returns_404_without_auto_create(
         "new_message": {"role": "user", "parts": [{"text": "Hello"}]},
     }
 
-    response = test_app.post(endpoint, json=payload)
-    assert response.status_code == 404
-    assert "Session not found" in response.json()["detail"]
+def test_patch_memory_unknown_session_returns_404(
+    test_app, test_session_info, mock_memory_service
+):
+  """A request naming a missing session must not reach the memory service."""
+  url = (
+      f"/apps/{test_session_info['app_name']}"
+      f"/users/{test_session_info['user_id']}/memory"
+  )
+
+  response = test_app.patch(url, json={"session_id": "no_such_session"})
+
+  assert response.status_code == 404
+  assert response.json()["detail"] == "Session not found"
+  mock_memory_service.add_session_to_memory.assert_not_called()
+
+
+#################################################
+# ApiServer vs DevServer endpoint surface
+#################################################
+
+
+def test_dev_only_endpoints_absent_when_web_disabled(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+):
+  """web=False serves ApiServer only: no eval / debug / graph routes."""
+  client = _create_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+      web=False,
+  )
+
+  dev_only_paths = [
+      "/config/telemetry",
+      "/dev/apps/test_app/eval-sets",
+      "/dev/apps/test_app/eval-results",
+      "/dev/apps/test_app/metrics-info",
+      "/dev/apps/test_app/tests",
+      "/dev/apps/test_app/graph",
+      "/dev/apps/test_app/debug/trace/some-event",
+  ]
+  for path in dev_only_paths:
+    assert client.get(path).status_code == 404, path
+
+  # The production endpoints are still there.
+  assert client.get("/health").status_code == 200
+  assert client.get("/list-apps").status_code == 200
+
+
+def _installed_internal_exporters(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+    *,
+    web: bool,
+) -> list[str]:
+  """Names of the span exporters the server registers on the tracer provider."""
+  with patch.object(
+      api_server_module, "_setup_telemetry", autospec=True
+  ) as mock_setup_telemetry:
+    _create_test_client(
+        mock_session_service,
+        mock_artifact_service,
+        mock_memory_service,
+        mock_agent_loader,
+        mock_eval_sets_manager,
+        mock_eval_set_results_manager,
+        web=web,
+    )
+  processors = mock_setup_telemetry.call_args.kwargs["internal_exporters"]
+  return [type(processor.span_exporter).__name__ for processor in processors]
+
+
+def test_span_buffers_not_filled_when_web_disabled(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+):
+  """Nothing reads the in-memory spans on web=False, so nothing writes them."""
+  assert (
+      _installed_internal_exporters(
+          mock_session_service,
+          mock_artifact_service,
+          mock_memory_service,
+          mock_agent_loader,
+          mock_eval_sets_manager,
+          mock_eval_set_results_manager,
+          web=False,
+      )
+      == []
+  )
+
+
+def test_span_buffers_filled_when_web_enabled(
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+):
+  """The dev server's trace views need the spans, so both exporters run."""
+  assert _installed_internal_exporters(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+      web=True,
+  ) == ["ApiServerSpanExporter", "InMemoryExporter"]
+
+
+def test_app_info_rejects_special_agent_only_in_api_server_mode(
+    test_app,
+    mock_session_service,
+    mock_artifact_service,
+    mock_memory_service,
+    mock_agent_loader,
+    mock_eval_sets_manager,
+    mock_eval_set_results_manager,
+):
+  """Internal `__` apps reach the dev server, but not the api server."""
+  api_only_client = _create_test_client(
+      mock_session_service,
+      mock_artifact_service,
+      mock_memory_service,
+      mock_agent_loader,
+      mock_eval_sets_manager,
+      mock_eval_set_results_manager,
+      web=False,
+  )
+
+  blocked = api_only_client.get("/apps/__internal_assistant/app-info")
+  assert blocked.status_code == 403
+  assert "internal special agents" in blocked.json()["detail"]
+
+  # Same request on the dev server gets past the guard and is answered on the
+  # merits of the loaded agent (which here is not an LlmAgent).
+  allowed = test_app.get("/apps/__internal_assistant/app-info")
+  assert allowed.status_code == 400
+  assert allowed.json()["detail"] == "Root agent is not an LlmAgent"
+
+
+def test_dev_endpoint_rejects_app_name_that_is_not_an_identifier(
+    builder_test_client,
+):
+  """_get_agent_dir only accepts dot-separated Python identifiers."""
+  ok = builder_test_client.get("/dev/apps/test_app/tests")
+  assert ok.status_code == 200
+  assert ok.json() == []
+
+  nested_ok = builder_test_client.get("/dev/apps/pkg.test_app/tests")
+  assert nested_ok.status_code == 200
+
+  for bad_name in ("bad-name", "1app", "app%20name"):
+    rejected = builder_test_client.get(f"/dev/apps/{bad_name}/tests")
+    assert rejected.status_code == 400, bad_name
+    assert "must be valid" in rejected.json()["detail"]
+
+
+#################################################
+# Eval endpoint plumbing
+#################################################
+
+
+def test_add_session_to_eval_set_builds_eval_case_from_session(
+    test_app, test_session_info, mock_eval_sets_manager
+):
+  """AddSessionToEvalSetRequest turns a live session into an eval case."""
+  app_name = test_session_info["app_name"]
+  user_id = test_session_info["user_id"]
+  mock_eval_sets_manager.create_eval_set(
+      app_name=app_name, eval_set_id="my_eval_set"
+  )
+
+  sessions_url = f"/apps/{app_name}/users/{user_id}/sessions"
+  created = test_app.post(
+      sessions_url,
+      json={
+          "session_id": "eval_source_session",
+          "events": [
+              {
+                  "author": "user",
+                  "invocationId": "inv-1",
+                  "content": {
+                      "role": "user",
+                      "parts": [{"text": "what is 2+2?"}],
+                  },
+              },
+              {
+                  "author": "dummy agent",
+                  "invocationId": "inv-1",
+                  "content": {"role": "model", "parts": [{"text": "4"}]},
+              },
+          ],
+      },
+  )
+  assert created.status_code == 200
+
+  response = test_app.post(
+      f"/dev/apps/{app_name}/eval-sets/my_eval_set/add-session",
+      json={
+          "eval_id": "my_eval_case",
+          "session_id": "eval_source_session",
+          "user_id": user_id,
+      },
+  )
+  assert response.status_code == 200
+
+  eval_case = mock_eval_sets_manager.get_eval_case(
+      app_name, "my_eval_set", "my_eval_case"
+  )
+  assert eval_case is not None
+  assert eval_case.session_input.app_name == app_name
+  assert eval_case.session_input.user_id == user_id
+  assert [
+      part.text
+      for invocation in eval_case.conversation
+      for part in invocation.user_content.parts
+  ] == ["what is 2+2?"]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="add-session maps ValueError, but the managers raise NotFoundError",
+)
+def test_add_session_to_eval_set_unknown_eval_set_is_a_client_error(
+    test_app, create_test_session
+):
+  """Adding to an eval set that never existed is a client error, not a 500."""
+  info = create_test_session
+
+  response = test_app.post(
+      f"/dev/apps/{info['app_name']}/eval-sets/missing_eval_set/add-session",
+      json={
+          "eval_id": "case-1",
+          "session_id": info["session_id"],
+          "user_id": info["user_id"],
+      },
+  )
+
+  assert 400 <= response.status_code < 500
+
+
+def test_get_eval_result_returns_saved_eval_set_result(
+    test_app, mock_eval_set_results_manager
+):
+  """The eval-results endpoint renames EvalSetResult to EvalResult as-is."""
+  mock_eval_set_results_manager.save_eval_set_result(
+      "test_app", "my_eval_set", []
+  )
+
+  response = test_app.get(
+      "/dev/apps/test_app/eval-results/test_app_my_eval_set_eval_result"
+  )
+
+  assert response.status_code == 200
+  data = response.json()
+  assert data["evalSetResultId"] == "test_app_my_eval_set_eval_result"
+  assert data["evalSetId"] == "my_eval_set"
+
+
+def test_create_eval_set_legacy_route_creates_eval_set(
+    test_app, mock_eval_sets_manager
+):
+  """The deprecated create-eval-set route should create an empty eval set."""
+  response = test_app.post("/dev/apps/test_app/eval_sets/legacy_eval_set")
+
+  assert response.status_code == 200
+  assert (
+      mock_eval_sets_manager.get_eval_set("test_app", "legacy_eval_set")
+      is not None
+  )
+
+
+def test_agent_run_sse_deferred_with_streaming_returns_422(
+    test_app, create_test_session
+):
+  """Deferred plus SSE is rejected up front, not mid-stream.
+
+  A deferred create returns an interaction id rather than a result, so it
+  cannot stream. The run config is built before the response starts so the
+  caller gets a status code instead of a 200 that breaks partway through.
+
+  Args:
+    test_app: The FastAPI test client.
+    create_test_session: Fixture creating the session the request targets.
+  """
+  payload = {
+      "app_name": create_test_session["app_name"],
+      "user_id": create_test_session["user_id"],
+      "session_id": create_test_session["session_id"],
+      "new_message": {"role": "user", "parts": [{"text": "Hello agent"}]},
+      "streaming": True,
+      "service_tier": "deferred",
+  }
+
+  response = test_app.post("/run_sse", json=payload)
+
+  assert response.status_code == 422
+  assert "cannot be used with StreamingMode.SSE" in response.json()["detail"]
+
+
+def test_agent_run_sse_deferred_without_streaming_is_allowed(
+    test_app, create_test_session, monkeypatch
+):
+  """Deferred is fine on /run_sse as long as the run is not streaming."""
+  info = create_test_session
+
+  async def run_async_stub(
+      self,  # pylint: disable=unused-argument
+      *,
+      user_id: str,
+      session_id: str,
+      invocation_id: Optional[str] = None,
+      new_message: Optional[types.Content] = None,
+      state_delta: Optional[dict[str, Any]] = None,
+      run_config: Optional[RunConfig] = None,
+  ):
+    del user_id, session_id, invocation_id, new_message, state_delta
+    assert run_config.service_tier == "deferred"
+    yield Event(
+        author="dummy agent",
+        invocation_id="invocation_id",
+        content=types.Content(role="model", parts=[types.Part(text="hi")]),
+    )
+
+  monkeypatch.setattr(Runner, "run_async", run_async_stub)
+
+  payload = {
+      "app_name": info["app_name"],
+      "user_id": info["user_id"],
+      "session_id": info["session_id"],
+      "new_message": {"role": "user", "parts": [{"text": "Hello agent"}]},
+      "streaming": False,
+      "service_tier": "deferred",
+  }
+
+  response = test_app.post("/run_sse", json=payload)
+
+  assert response.status_code == 200
+
+
+def test_runtime_config_endpoint_shadows_static_file(tmp_path):
+  """The in-memory config must win over the file still shipped in the package.
+
+  ApiServer registers this route before mounting StaticFiles at "/dev-ui/".
+  Starlette matches in registration order, so moving the route after the mount
+  would silently serve the stale on-disk file instead -- with a 200 and no
+  error. Assert on the payload, not just the status code.
+  """
+  app = get_fast_api_app(
+      agents_dir=str(tmp_path), web=True, url_prefix="/custom"
+  )
+
+  # The prefix is stripped by whatever mounts the app (reverse proxy, gateway,
+  # or an outer Starlette Mount); ADK registers its routes unprefixed.
+  outer = Starlette(routes=[Mount("/custom", app)])
+  response = TestClient(outer).get(
+      "/custom/dev-ui/assets/config/runtime-config.json"
+  )
+
+  assert response.status_code == 200
+  body = response.json()
+  # A stale file on disk would report "" here.
+  assert body["backendUrl"] == "/custom"
+  assert "telemetry" in body
+  assert response.headers["cache-control"] == "no-store"
+
+
+def test_runtime_config_endpoint_does_not_write_to_disk(tmp_path):
+  """Serving the config must not touch the installed package directory."""
+  import google.adk.cli as cli_package
+
+  config_path = (
+      Path(cli_package.__file__).parent
+      / "browser"
+      / "assets"
+      / "config"
+      / "runtime-config.json"
+  )
+  before = config_path.read_bytes() if config_path.exists() else None
+
+  app = get_fast_api_app(
+      agents_dir=str(tmp_path), web=True, url_prefix="/prefix"
+  )
+  TestClient(app).get("/dev-ui/assets/config/runtime-config.json")
+
+  after = config_path.read_bytes() if config_path.exists() else None
+  assert after == before
+
+
+def test_runtime_config_rejects_half_specified_logo(tmp_path):
+  """--logo-text without --logo-image-url is a config error, not a silent drop."""
+  with pytest.raises(ValueError, match="Both --logo-text and --logo-image-url"):
+    get_fast_api_app(agents_dir=str(tmp_path), web=True, logo_text="ACME")
 
 
 if __name__ == "__main__":

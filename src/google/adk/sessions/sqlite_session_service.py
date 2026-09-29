@@ -118,11 +118,9 @@ def _parse_db_path(db_path: str) -> tuple[str, str, bool]:
     if not raw_path:
         return db_path, db_path, False
 
-    normalized_path = raw_path
-    if normalized_path.startswith("//"):
-        normalized_path = normalized_path[1:]
-    elif normalized_path.startswith("/"):
-        normalized_path = normalized_path[1:]
+  normalized_path = raw_path
+  if normalized_path.startswith("/"):
+    normalized_path = normalized_path[1:]
 
     if parsed.query:
         # sqlite3 only treats the filename as a URI when it starts with `file:`.
@@ -585,17 +583,136 @@ class SqliteSessionService(BaseSessionService):
                 if not cursor.fetchone():
                     return False  # No events table, so no migration needed.
 
-                # If events table exists, check for event_data column
-                cursor.execute("PRAGMA table_info(events)")
-                columns = [row[1] for row in cursor.fetchall()]
-                if "event_data" in columns:
-                    return False  # New schema: event_data column exists.
-                else:
-                    return True  # Old schema: events table exists, but no event_data column.
-        except sqlite3.Error as e:
-            raise RuntimeError(
-                f"Error accessing database {self._db_path}: {e}"
-            ) from e
+    # Also update the in-memory session
+    return self._commit_event_to_session(session, event)
+
+  @asynccontextmanager
+  async def _get_db_connection(self) -> AsyncIterator[aiosqlite.Connection]:
+    """Connects to the db and performs initial setup."""
+    async with aiosqlite.connect(
+        self._db_connect_path, uri=self._db_connect_uri
+    ) as db:
+      db.row_factory = aiosqlite.Row
+      await db.execute(PRAGMA_FOREIGN_KEYS)
+      if not self._schema_ready:
+        await db.executescript(CREATE_SCHEMA_SQL)
+        self._schema_ready = True
+      yield db
+
+  async def _get_state(
+      self,
+      db: aiosqlite.Connection,
+      query: str,
+      params: tuple[object, ...],
+  ) -> dict[str, Any]:
+    """Fetches and deserializes a JSON state column from a single row."""
+    async with db.execute(query, params) as cursor:
+      row = await cursor.fetchone()
+      return _decode_state(row["state"]) if row else {}
+
+  async def _get_app_state(
+      self, db: aiosqlite.Connection, app_name: str
+  ) -> dict[str, Any]:
+    return await self._get_state(
+        db, "SELECT state FROM app_states WHERE app_name=?", (app_name,)
+    )
+
+  async def _get_user_state(
+      self, db: aiosqlite.Connection, app_name: str, user_id: str
+  ) -> dict[str, Any]:
+    return await self._get_state(
+        db,
+        "SELECT state FROM user_states WHERE app_name=? AND user_id=?",
+        (app_name, user_id),
+    )
+
+  async def _upsert_app_state(
+      self,
+      db: aiosqlite.Connection,
+      app_name: str,
+      delta: dict[str, Any],
+      now: float,
+  ) -> None:
+    """Atomically inserts or updates app state with dict.update() semantics."""
+    await db.execute(
+        f"""
+        INSERT INTO app_states (app_name, state, update_time) VALUES (?, ?, ?)
+        ON CONFLICT(app_name) DO UPDATE SET state=({_MERGE_STATE_SQL.format(delta='excluded.state', state='state')}), update_time=excluded.update_time
+        """,
+        (app_name, json.dumps(delta), now),
+    )
+
+  async def _upsert_user_state(
+      self,
+      db: aiosqlite.Connection,
+      app_name: str,
+      user_id: str,
+      delta: dict[str, Any],
+      now: float,
+  ) -> None:
+    """Atomically inserts or updates user state with dict.update() semantics."""
+    await db.execute(
+        f"""
+        INSERT INTO user_states (app_name, user_id, state, update_time) VALUES (?, ?, ?, ?)
+        ON CONFLICT(app_name, user_id) DO UPDATE SET state=({_MERGE_STATE_SQL.format(delta='excluded.state', state='state')}), update_time=excluded.update_time
+        """,
+        (app_name, user_id, json.dumps(delta), now),
+    )
+
+  async def _update_session_state_in_db(
+      self,
+      db: aiosqlite.Connection,
+      app_name: str,
+      user_id: str,
+      session_id: str,
+      delta: dict[str, Any],
+      now: float,
+  ) -> None:
+    """Atomically updates session state with dict.update() semantics."""
+    delta_json = json.dumps(delta)
+    await db.execute(
+        "UPDATE sessions SET"
+        f" state=({_MERGE_STATE_SQL.format(delta='?', state='state')}),"
+        " update_time=? WHERE app_name=? AND user_id=? AND id=?",
+        (
+            delta_json,
+            delta_json,
+            now,
+            app_name,
+            user_id,
+            session_id,
+        ),
+    )
+
+  def _is_migration_needed(self) -> bool:
+    """Checks if migration to new schema is needed."""
+    if not os.path.exists(self._db_path):
+      return False
+    try:
+      with sqlite3.connect(
+          self._db_connect_path, uri=self._db_connect_uri
+      ) as conn:
+        cursor = conn.cursor()
+        # Check if events table exists
+        cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' and name='events'"
+        )
+        if not cursor.fetchone():
+          return False  # No events table, so no migration needed.
+
+        # If events table exists, check for event_data column
+        cursor.execute("PRAGMA table_info(events)")
+        columns = [row[1] for row in cursor.fetchall()]
+        if "event_data" in columns:
+          return False  # New schema: event_data column exists.
+        else:
+          return (
+              True  # Old schema: events table exists, but no event_data column.
+          )
+    except sqlite3.Error as e:
+      raise RuntimeError(
+          f"Error accessing database {self._db_path}: {e}"
+      ) from e
 
 
 def _merge_state(app_state, user_state, session_state):

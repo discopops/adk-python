@@ -42,8 +42,72 @@ from .session import Session
 
 logger = logging.getLogger("google_adk." + __name__)
 
-_COMPACTION_CUSTOM_METADATA_KEY = "_compaction"
-_USAGE_METADATA_CUSTOM_METADATA_KEY = "_usage_metadata"
+_COMPACTION_CUSTOM_METADATA_KEY = '_compaction'
+_USAGE_METADATA_CUSTOM_METADATA_KEY = '_usage_metadata'
+
+# The event fields the API carries under names of its own, which is all an
+# event keeps when raw_event is rejected. This mirrors the Event built by the
+# fallback branch of _from_api_event; every other field is dropped on write.
+_FIELD_BY_FIELD_EVENT_FIELDS = frozenset({
+    'id',
+    'invocation_id',
+    'author',
+    'actions',
+    'content',
+    'timestamp',
+    'error_code',
+    'error_message',
+    'partial',
+    'turn_complete',
+    'interrupted',
+    'branch',
+    'custom_metadata',
+    'grounding_metadata',
+    'long_running_tool_ids',
+    'usage_metadata',
+})
+
+_SESSION_ID_PATTERN = re.compile(r'^[A-Za-z0-9_-]+$')
+
+
+def _extract_short_session_id(
+    session_id: str, expected_engine_id: str | None = None
+) -> str:
+  """Extracts the short session ID if a full resource name is provided."""
+  if isinstance(session_id, str) and '/' in session_id:
+    parts = session_id.split('/')
+    if len(parts) >= 2 and parts[-2] == 'sessions':
+      if (
+          len(parts) >= 4
+          and parts[-4] == 'reasoningEngines'
+          and expected_engine_id
+      ):
+        passed_engine_id = parts[-3]
+        if passed_engine_id != expected_engine_id:
+          raise ValueError(
+              'Session resource name mismatch: session belongs to '
+              f'reasoningEngine {passed_engine_id!r}, but service is '
+              f'configured for {expected_engine_id!r}.'
+          )
+      return parts[-1]
+  return session_id
+
+
+def _validate_session_id(session_id: str) -> None:
+  """Rejects session IDs that could escape the URL path segment."""
+  if not isinstance(session_id, str) or not _SESSION_ID_PATTERN.fullmatch(
+      session_id
+  ):
+    raise ValueError(
+        f'Invalid session_id {session_id!r}: must match'
+        f' {_SESSION_ID_PATTERN.pattern}.'
+    )
+
+
+def _quote_filter_literal(value: str) -> str:
+  """Quotes filter values so embedded metacharacters stay inside the literal."""
+  escaped_value = value.replace('\\', '\\\\').replace('"', '\\"')
+  return f'"{escaped_value}"'
 
 
 def _set_internal_custom_metadata(
@@ -265,16 +329,16 @@ class VertexAiSessionService(BaseSessionService):
     ) -> None:
         reasoning_engine_id = self._get_reasoning_engine_id(app_name)
 
-        async with self._get_api_client() as api_client:
-            try:
-                await api_client.agent_engines.sessions.delete(
-                    name=(
-                        f"reasoningEngines/{reasoning_engine_id}/sessions/{session_id}"
-                    ),
-                )
-            except Exception as e:
-                logger.error("Error deleting session %s: %s", session_id, e)
-                raise
+  @override
+  async def append_event(self, session: Session, event: Event) -> Event:
+    if not event.partial:
+      # Apply temp-scoped state to the in-memory session and strip it from
+      # the event before the remote append succeeds. Normal state and the
+      # event itself are only applied to the session once the remote append
+      # succeeds, so a failed append leaves the session unchanged and a
+      # retry does not re-apply state or duplicate the event.
+      self._apply_temp_state(session, event)
+      event = self._trim_temp_delta_state(event)
 
     @override
     async def append_event(self, session: Session, event: Event) -> Event:
@@ -366,9 +430,24 @@ class VertexAiSessionService(BaseSessionService):
             )
         return event
 
-    def _get_reasoning_engine_id(self, app_name: str):
-        if self._agent_engine_id:
-            return self._agent_engine_id
+      try:
+        await _do_append(config)
+      except pydantic.ValidationError:
+        _session_util.warn_event_fields_not_stored(
+            _FIELD_BY_FIELD_EVENT_FIELDS,
+            cause=(
+                'The installed Vertex AI SDK does not support raw_event, so an'
+                ' event is stored under the named fields the API defines'
+            ),
+            remedy='Upgrade the Vertex AI SDK to keep them.',
+        )
+        if 'raw_event' in config:
+          del config['raw_event']
+        await _do_append(config)
+
+    if not event.partial:
+      self._commit_event_to_session(session, event)
+    return event
 
         if app_name.isdigit():
             return app_name

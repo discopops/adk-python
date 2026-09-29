@@ -27,9 +27,13 @@ from typing import Optional
 import click
 from fastapi import FastAPI
 from fastapi import HTTPException
-from fastapi import UploadFile
-from fastapi.responses import FileResponse
-from fastapi.responses import PlainTextResponse
+from fastapi import Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
+from fastapi.responses import StreamingResponse
+from google.genai import types
+from opentelemetry import context
+from opentelemetry import trace
 from opentelemetry.sdk.trace import export
 from opentelemetry.sdk.trace import TracerProvider
 from starlette.types import Lifespan
@@ -98,6 +102,16 @@ def get_fast_api_app(
     logo_text: Optional[str] = None,
     logo_image_url: Optional[str] = None,
     auto_create_session: bool = False,
+    trigger_sources: list[Literal["pubsub", "eventarc"]] | None = None,
+    trigger_oidc_audience: str | None = None,
+    trigger_oidc_service_accounts: list[str] | None = None,
+    trigger_auth_verifier: (
+        Callable[[Request], None | Awaitable[None]] | None
+    ) = None,
+    default_llm_model: str | None = None,
+    gemini_enterprise_app_name: str | None = None,
+    express_mode: bool = False,
+    avatar_config: types.AvatarConfig | None = None,
 ) -> FastAPI:
     """Constructs and returns a FastAPI application for serving ADK agents.
 
@@ -106,41 +120,65 @@ def get_fast_api_app(
     configures the ADK Web Server, and optionally enables advanced features
     like Agent-to-Agent (A2A) protocol support and cloud telemetry.
 
-    Args:
-      agents_dir: The root directory containing agent definitions. This path is
-        used to discover agents, load custom service registrations (via
-        services.py/yaml), and as a base for local storage.
-      agent_loader: An optional custom loader for retrieving agent instances. If
-        not provided, a default AgentLoader targeting agents_dir is used.
-      session_service_uri: A URI defining the backend for session persistence.
-        Supports schemes like 'memory://', 'sqlite://', 'postgresql://',
-        'mysql://', or 'agentengine://'. Defaults to per-agent local SQLite
-        storage if None.
-      session_db_kwargs: Optional keyword arguments for custom session service
-        initialization. These are passed to the service factory along with the
-        URI.
-      artifact_service_uri: URI for the artifact service. Uses local artifact
-        service if None.
-      memory_service_uri: URI for the memory service. Uses local memory service if
-        None.
-      use_local_storage: Whether to use local storage for session and artifacts.
-      eval_storage_uri: URI for evaluation storage. If provided, uses GCS
-        managers.
-      allow_origins: List of allowed origins for CORS.
-      web: Whether to enable the web UI and serve its assets.
-      a2a: Whether to enable Agent-to-Agent (A2A) protocol support.
-      host: Host address for the server (defaults to 127.0.0.1).
-      port: Port number for the server (defaults to 8000).
-      url_prefix: Optional prefix for all URL routes.
-      trace_to_cloud: Whether to export traces to Google Cloud Trace.
-      otel_to_cloud: Whether to export OpenTelemetry data to Google Cloud.
-      reload_agents: Whether to watch for file changes and reload agents.
-      lifespan: Optional FastAPI lifespan context manager.
-      extra_plugins: List of extra plugin names to load.
-      logo_text: Text to display in the web UI logo area.
-      logo_image_url: URL for an image to display in the web UI logo area.
-      auto_create_session: Whether to automatically create a session when
-        not found.
+  Args:
+    agents_dir: The root directory containing agent definitions. This path is
+      used to discover agents, load custom service registrations (via
+      services.py/yaml), and as a base for local storage.
+    agent_loader: An optional custom loader for retrieving agent instances. If
+      not provided, a default AgentLoader targeting agents_dir is used.
+    session_service_uri: A URI defining the backend for session persistence.
+      Supports schemes like 'memory://', 'sqlite://', 'postgresql://',
+      'mysql://', or 'agentengine://'. Defaults to per-agent local SQLite
+      storage if None.
+    session_db_kwargs: Optional keyword arguments for custom session service
+      initialization. These are passed to the service factory along with the
+      URI.
+    artifact_service_uri: URI for the artifact service. Uses local artifact
+      service if None.
+    memory_service_uri: URI for the memory service. Uses local memory service if
+      None.
+    use_local_storage: Whether to use local storage for session and artifacts.
+    eval_storage_uri: URI for evaluation storage. If provided, uses GCS
+      managers.
+    allow_origins: List of allowed origins for CORS.
+    web: Whether to enable the web UI and serve its assets.
+    a2a: Whether to enable Agent-to-Agent (A2A) protocol support.
+    task_store_uri: URI for the A2A task store. Uses in-memory task store if
+      None. Only used when ``a2a=True``.
+    host: Host address for the server (defaults to 127.0.0.1). Unused by the
+      returned app; pass ``bind_host`` to guard it.
+    bind_host: The address the caller will bind the returned app to. A loopback
+      value turns on DNS-rebinding protection, which rejects requests addressed
+      to any other host. Leave it None to serve the app yourself without that.
+    port: Port number for the server (defaults to 8000).
+    url_prefix: Optional prefix for all URL routes.
+    trace_to_cloud: Whether to export traces to Google Cloud Trace.
+    otel_to_cloud: Whether to export OpenTelemetry data to Google Cloud.
+    reload_agents: Whether to watch for file changes and reload agents.
+    lifespan: Optional FastAPI lifespan context manager.
+    extra_plugins: List of extra plugin names to load.
+    logo_text: Text to display in the web UI logo area.
+    logo_image_url: URL for an image to display in the web UI logo area.
+    auto_create_session: Whether to automatically create a session when not
+      found.
+    trigger_sources: List of trigger sources to enable (e.g. ["pubsub",
+      "eventarc"]). When set, registers /trigger/* endpoints for batch and
+      event-driven agent invocations. None disables all trigger endpoints.
+    trigger_oidc_audience: When set, every /trigger/* request must carry a
+      Google-signed OIDC bearer token whose audience matches this value.
+    trigger_oidc_service_accounts: When set alongside ``trigger_oidc_audience``,
+      every /trigger/* request's bearer token must be owned by one of these
+      service account emails. This completes authentication of the caller. When
+      None (the default), token signatures and audience are still verified if
+      ``trigger_oidc_audience`` is set, but caller identity is not enforced.
+    trigger_auth_verifier: A custom callable to verify incoming trigger
+      requests. Takes a FastAPI ``Request`` and should raise ``HTTPException``
+      on failure. When set, overrides ``trigger_oidc_audience``.
+    default_llm_model: Default LLM model to use for the agent.
+    gemini_enterprise_app_name: The Gemini Enterprise app name to use for the
+      agent.
+    express_mode: Whether to enable express mode.
+    avatar_config: Avatar configuration to apply to live agent runs.
 
     Returns:
       The configured FastAPI application instance.
@@ -194,8 +232,27 @@ def get_fast_api_app(
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    # Build  the Credential service
-    credential_service = InMemoryCredentialService()
+  adk_web_server = ServerClass(
+      agent_loader=agent_loader,
+      session_service=session_service,
+      artifact_service=artifact_service,
+      memory_service=memory_service,
+      credential_service=credential_service,
+      eval_sets_manager=eval_sets_manager,
+      eval_set_results_manager=eval_set_results_manager,
+      agents_dir=agents_dir,
+      extra_plugins=extra_plugins,
+      logo_text=logo_text,
+      logo_image_url=logo_image_url,
+      url_prefix=url_prefix,
+      auto_create_session=auto_create_session,
+      trigger_sources=trigger_sources,
+      trigger_oidc_audience=trigger_oidc_audience,
+      trigger_oidc_service_accounts=trigger_oidc_service_accounts,
+      trigger_auth_verifier=trigger_auth_verifier,
+      default_llm_model=default_llm_model,
+      avatar_config=avatar_config,
+  )
 
     adk_web_server = AdkWebServer(
         agent_loader=agent_loader,

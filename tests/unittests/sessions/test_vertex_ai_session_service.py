@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import copy
 import datetime
 import re
@@ -530,20 +532,24 @@ def mock_vertex_ai_session_service(
 
 @pytest.fixture
 def mock_api_client_instance():
-    """Creates a mock API client instance for testing."""
-    api_client = MockAsyncClient()
-    api_client.session_dict = {
-        "1": MOCK_SESSION_JSON_1,
-        "2": MOCK_SESSION_JSON_2,
-        "3": MOCK_SESSION_JSON_3,
-        "page1": MOCK_SESSION_JSON_PAGE1,
-        "page2": MOCK_SESSION_JSON_PAGE2,
-    }
-    api_client.event_dict = {
-        "1": (copy.deepcopy(MOCK_EVENT_JSON), None),
-        "2": (copy.deepcopy(MOCK_EVENT_JSON_2), "my_token"),
-    }
-    return api_client
+  """Creates a mock API client instance for testing."""
+  api_client = MockAsyncClient()
+  # Deep-copy the session payloads like the events below: the mock client
+  # mutates `session_dict[...]['update_time']` when an event is appended, and
+  # sharing the module-level dicts across tests would leak that update into
+  # later tests that compare against `MOCK_SESSION`.
+  api_client.session_dict = {
+      '1': copy.deepcopy(MOCK_SESSION_JSON_1),
+      '2': copy.deepcopy(MOCK_SESSION_JSON_2),
+      '3': copy.deepcopy(MOCK_SESSION_JSON_3),
+      'page1': copy.deepcopy(MOCK_SESSION_JSON_PAGE1),
+      'page2': copy.deepcopy(MOCK_SESSION_JSON_PAGE2),
+  }
+  api_client.event_dict = {
+      '1': (copy.deepcopy(MOCK_EVENT_JSON), None),
+      '2': (copy.deepcopy(MOCK_EVENT_JSON_2), 'my_token'),
+  }
+  return api_client
 
 
 @pytest.fixture
@@ -852,7 +858,167 @@ async def test_append_event():
 
 
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("mock_get_api_client")
+async def test_append_event_does_not_mutate_session_on_remote_failure() -> None:
+  """A failed remote append must not mutate the session.
+
+  Normal state and the event list must be left untouched (temp state remains,
+  since it is invocation-local), and a successful retry must apply the delta and
+  append the event exactly once.
+  """
+  append = mock.AsyncMock(side_effect=[RuntimeError('network failure'), None])
+  client = types.SimpleNamespace(
+      agent_engines=types.SimpleNamespace(
+          sessions=types.SimpleNamespace(
+              events=types.SimpleNamespace(append=append),
+          )
+      )
+  )
+
+  @asynccontextmanager
+  async def fake_client() -> AsyncIterator[types.SimpleNamespace]:
+    yield client
+
+  session_service = mock_vertex_ai_session_service()
+  session = Session(
+      id='1',
+      app_name='123',
+      user_id='user',
+      state={'existing': 'value'},
+  )
+  event = Event(
+      invocation_id='invocation',
+      author='model',
+      actions=EventActions(
+          state_delta={
+              'normal': 'persisted',
+              'temp:scratch': 'ephemeral',
+          }
+      ),
+  )
+
+  with mock.patch.object(session_service, '_get_api_client', fake_client):
+    with pytest.raises(RuntimeError):
+      await session_service.append_event(session, event)
+
+    assert session.state == {'existing': 'value', 'temp:scratch': 'ephemeral'}
+    assert len(session.events) == 0
+
+    await session_service.append_event(session, event)
+
+    assert session.state == {
+        'existing': 'value',
+        'temp:scratch': 'ephemeral',
+        'normal': 'persisted',
+    }
+    assert len(session.events) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+async def test_append_event_strips_unsupported_part_metadata(
+    mock_api_client_instance: MockAsyncClient,
+) -> None:
+  """part_metadata must not reach the Sessions API.
+
+  ``Part.part_metadata`` is a Gemini Developer API-only field; the Vertex AI
+  Agent Engine Sessions ``appendEvent`` API rejects it with 400 INVALID_ARGUMENT
+  ("Unknown name \"part_metadata\""). It must be dropped from both the
+  ``content`` and ``raw_event`` payloads, while the part text is preserved.
+  """
+  session_service = mock_vertex_ai_session_service()
+  session = await session_service.get_session(
+      app_name='123', user_id='user', session_id='1'
+  )
+  event_to_append = Event(
+      invocation_id='inv_part_metadata',
+      author='user',
+      timestamp=1734005533.0,
+      content=genai_types.Content(
+          parts=[
+              genai_types.Part(
+                  text='hello', part_metadata={'source': 'portal'}
+              ),
+              genai_types.Part(text='world', part_metadata={'n': 1}),
+          ],
+      ),
+  )
+
+  await session_service.append_event(session, event_to_append)
+
+  appended = mock_api_client_instance.event_dict['1'][0][-1]
+  for part in appended['content']['parts']:
+    assert 'part_metadata' not in part
+    assert 'partMetadata' not in part
+  for part in appended['raw_event']['content']['parts']:
+    assert 'part_metadata' not in part
+    assert 'partMetadata' not in part
+  assert [p['text'] for p in appended['content']['parts']] == ['hello', 'world']
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+async def test_append_event_with_part_metadata_round_trips(
+    mock_api_client_instance: MockAsyncClient,
+) -> None:
+  """Reconstruction side: an event carrying part_metadata appends and
+  reads back without error. part_metadata is dropped (unsupported on Vertex),
+  but the session round-trips and the part text is preserved.
+  """
+  session_service = mock_vertex_ai_session_service()
+  session = await session_service.get_session(
+      app_name='123', user_id='user', session_id='1'
+  )
+  event_to_append = Event(
+      invocation_id='inv_part_metadata_rt',
+      author='user',
+      timestamp=1734005533.0,
+      content=genai_types.Content(
+          role='user',
+          parts=[
+              genai_types.Part(text='hello', part_metadata={'source': 'portal'})
+          ],
+      ),
+  )
+
+  await session_service.append_event(session, event_to_append)
+  retrieved = await session_service.get_session(
+      app_name='123', user_id='user', session_id='1'
+  )
+
+  appended = next(
+      e for e in retrieved.events if e.invocation_id == 'inv_part_metadata_rt'
+  )
+  assert appended.content is not None
+  assert appended.content.parts[0].text == 'hello'
+  assert appended.content.parts[0].part_metadata is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
+async def test_append_event_round_trips_event_id() -> None:
+  session_service = mock_vertex_ai_session_service()
+  session = await session_service.get_session(
+      app_name='123', user_id='user', session_id='1'
+  )
+  event_to_append = Event(
+      invocation_id='inv_event_id_rt',
+      author='user',
+      timestamp=1734005535.0,
+  )
+
+  await session_service.append_event(session, event_to_append)
+  retrieved = await session_service.get_session(
+      app_name='123', user_id='user', session_id='1'
+  )
+
+  appended = next(
+      e for e in retrieved.events if e.invocation_id == 'inv_event_id_rt'
+  )
+  assert appended.id == event_to_append.id
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures('mock_get_api_client')
 async def test_append_event_with_compaction():
     """Compaction data round-trips through append_event and get_session."""
     session_service = mock_vertex_ai_session_service()

@@ -25,7 +25,7 @@ from typing import List
 from typing import Optional
 from typing import Protocol
 from typing import runtime_checkable
-from typing import Union
+from typing import TYPE_CHECKING
 import warnings
 
 from fastapi.openapi.models import APIKeyIn
@@ -43,12 +43,24 @@ from ...auth.auth_tool import AuthConfig
 from ...events.ui_widget import UiWidget
 from ...features import FeatureName
 from ...features import is_feature_enabled
+from ...flows.llm_flows.context._fencing import fence_schema_descriptions
+from ...flows.llm_flows.context._fencing import fence_tool_description
+from ...flows.llm_flows.context._fencing import TOOL_DESCRIPTION_PREAMBLE
+from ...flows.llm_flows.tools._functions import REQUEST_CONFIRMATION_FUNCTION_CALL_NAME
+from ...flows.llm_flows.tools._functions import REQUEST_EUC_FUNCTION_CALL_NAME
+from ...flows.llm_flows.tools._functions import REQUEST_INPUT_FUNCTION_CALL_NAME
 from ...utils.context_utils import find_context_parameter
 from .._gemini_schema_util import _to_gemini_schema
 from ..base_authenticated_tool import BaseAuthenticatedTool
 from ..tool_context import ToolContext
+from ..transfer_to_agent_tool import transfer_to_agent
+from .mcp_session_manager import _http_debug_var
+from .mcp_session_manager import _is_session_terminated_error
 from .mcp_session_manager import MCPSessionManager
 from .mcp_session_manager import retry_on_errors
+
+if TYPE_CHECKING:
+  from ...models.llm_request import LlmRequest
 
 logger = logging.getLogger("google_adk." + __name__)
 
@@ -191,31 +203,104 @@ class McpTool(BaseAuthenticatedTool):
     def _get_declaration(self) -> FunctionDeclaration:
         """Gets the function declaration for the tool.
 
-        Returns:
-            FunctionDeclaration: The Gemini function declaration for the tool.
-        """
-        input_schema = self._mcp_tool.inputSchema
-        output_schema = self._mcp_tool.outputSchema
-        if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
-            function_decl = FunctionDeclaration(
-                name=self.name,
-                description=self.description,
-                parameters_json_schema=input_schema,
-                response_json_schema=output_schema,
-            )
-        else:
-            parameters = _to_gemini_schema(input_schema)
-            function_decl = FunctionDeclaration(
-                name=self.name,
-                description=self.description,
-                parameters=parameters,
-            )
-        return function_decl
+    Returns:
+      FunctionDeclaration: The Gemini function declaration for the tool.
+    """
+    return self._build_declaration(fenced=False)
 
-    @property
-    def raw_mcp_tool(self) -> McpBaseTool:
-        """Returns the raw MCP tool."""
-        return self._mcp_tool
+  def _build_fenced_declaration(self) -> FunctionDeclaration:
+    """Builds the fenced function declaration for the tool."""
+    return self._build_declaration(fenced=True)
+
+  def _build_declaration(self, *, fenced: bool = False) -> FunctionDeclaration:
+    input_schema = _read_field(self._mcp_tool, "inputSchema", "input_schema")
+    description = (
+        fence_tool_description(self.description) if fenced else self.description
+    )
+    input_schema = (
+        fence_schema_descriptions(input_schema)
+        if fenced and input_schema is not None
+        else input_schema
+    )
+    if is_feature_enabled(FeatureName.JSON_SCHEMA_FOR_FUNC_DECL):
+      output_schema = _read_field(
+          self._mcp_tool, "outputSchema", "output_schema"
+      )
+      output_schema = (
+          fence_schema_descriptions(output_schema)
+          if fenced and output_schema is not None
+          else output_schema
+      )
+      function_decl = FunctionDeclaration(
+          name=self.name,
+          description=description,
+          parameters_json_schema=input_schema,
+          response_json_schema=output_schema,
+      )
+    else:
+      parameters = _to_gemini_schema(input_schema)
+      function_decl = FunctionDeclaration(
+          name=self.name,
+          description=description,
+          parameters=parameters,
+      )
+    return function_decl
+
+  @override
+  async def process_llm_request(
+      self, *, tool_context: ToolContext, llm_request: LlmRequest
+  ) -> None:
+    await super().process_llm_request(
+        tool_context=tool_context, llm_request=llm_request
+    )
+    if (
+        llm_request.config
+        and llm_request.config.system_instruction is not None
+        and not isinstance(llm_request.config.system_instruction, str)
+    ):
+      logger.error(
+          "Cannot fence tool descriptions: system_instruction must be a str or"
+          " None, got %s; skipping fencing for this request.",
+          type(llm_request.config.system_instruction).__name__,
+      )
+      return
+
+    # The tool declaration is fenced when it goes to the model, while
+    # _get_declaration keeps the server's own text for other consumers
+    # (e.g. dev UI tool listings via get_tools_info).
+    replaced = False
+    if llm_request.config and llm_request.config.tools:
+      for tool in reversed(llm_request.config.tools):
+        function_declarations = getattr(tool, "function_declarations", None)
+        if function_declarations:
+          for i in range(len(function_declarations) - 1, -1, -1):
+            if getattr(function_declarations[i], "name", None) == self.name:
+              function_declarations[i] = self._build_fenced_declaration()
+              replaced = True
+              break
+        if replaced:
+          break
+
+    if not replaced:
+      logger.error(
+          "Failed to find function declaration for tool %r in LlmRequest to"
+          " apply fencing.",
+          self.name,
+      )
+
+    current_instruction = (
+        llm_request.config.system_instruction
+        if llm_request.config
+        and isinstance(llm_request.config.system_instruction, str)
+        else ""
+    )
+    if TOOL_DESCRIPTION_PREAMBLE not in current_instruction:
+      llm_request.append_instructions([TOOL_DESCRIPTION_PREAMBLE])
+
+  @property
+  def raw_mcp_tool(self) -> McpBaseTool:
+    """Returns the raw MCP tool."""
+    return self._mcp_tool
 
     @property
     def visibility(self) -> List[str]:
@@ -371,19 +456,259 @@ class McpTool(BaseAuthenticatedTool):
         propagate.get_global_textmap().inject(carrier=trace_carrier)
         meta_trace_context = trace_carrier if trace_carrier else None
 
-        # Get the session from the session manager
-        session = await self._mcp_session_manager.create_session(
-            headers=final_headers
-        )
+    Returns:
+        Any: The response from the tool.
+    """
+    # Extract headers from credential for session pooling
+    auth_headers = await self._get_headers(tool_context, credential)
+    dynamic_headers = None
+    if self._header_provider:
+      dynamic_headers = self._header_provider(
+          ReadonlyContext(tool_context._invocation_context)  # pylint: disable=protected-access
+      )
+      if inspect.isawaitable(dynamic_headers):
+        dynamic_headers = await dynamic_headers
+
+    headers: dict[str, str] = {}
+    if auth_headers:
+      headers.update(auth_headers)
+    if dynamic_headers:
+      headers.update(dynamic_headers)
+    final_headers = headers if headers else None
+
+    # Propagate trace context in the _meta field as sprcified by MCP protocol.
+    # See https://agentclientprotocol.com/protocol/extensibility#the-meta-field
+    trace_carrier: dict[str, str] = {}
+    propagate.get_global_textmap().inject(carrier=trace_carrier)
+    meta_trace_context = trace_carrier if trace_carrier else None
+
+    # Get the session from the session manager
+    session = await self._create_session(headers=final_headers)
+
+    # Resolve progress callback (may be a factory that needs runtime context)
+    resolved_callback = self._resolve_progress_callback(tool_context)
+
+    call_coro = session.call_tool(
+        self._mcp_tool.name,
+        arguments=args,
+        progress_callback=resolved_callback,
+        meta=meta_trace_context,
+    )
+
+    # Hold the session out of the pool's idle sweep for as long as the call
+    # runs. A tool call can easily outlive the idle TTL, and a session that
+    # only looks idle because its call has not come back yet must not have
+    # its transport closed underneath it.
+    self._mcp_session_manager._begin_session_use(final_headers)  # pylint: disable=protected-access
+    try:
+      try:
+        if is_feature_enabled(FeatureName._MCP_GRACEFUL_ERROR_HANDLING):  # pylint: disable=protected-access
+          # Race the tool call against the background session task so that
+          # transport crashes (e.g. non-2xx HTTP responses from an AGW with
+          # Model Armor) surface immediately instead of hanging until
+          # sse_read_timeout (default 5 minutes) expires. ConnectionError is
+          # intentionally NOT caught here. Replaying a tool call after an
+          # ambiguous transport failure could duplicate a remote side effect, so
+          # the failure surfaces to the run_async wrapper without an automatic
+          # retry.
+          #
+          # The isinstance check is intentional: tests and external subclasses
+          # may inject mock session managers whose `_get_session_context`
+          # returns a Mock instead of a real SessionContext (or None). Falling
+          # back to the direct await keeps those callers working.
+          session_context = self._mcp_session_manager._get_session_context(  # pylint: disable=protected-access
+              headers=final_headers
+          )
+          if isinstance(session_context, SessionContext):
+            response = await session_context._run_guarded(call_coro)  # pylint: disable=protected-access
+          else:
+            response = await call_coro
+        else:
+          # Pre-fix behavior: await the call directly. This is what causes the
+          # ~300s hang when the underlying transport crashes.
+          response = await call_coro
+      except Exception as e:
+        # The server has forgotten this session, so drop it here rather than
+        # let the next call be handed the same dead one.
+        if _is_session_terminated_error(e):
+          self._mcp_session_manager._discard_session(  # pylint: disable=protected-access
+              final_headers, session=session
+          )
+        raise
+    finally:
+      self._mcp_session_manager._end_session_use(final_headers)  # pylint: disable=protected-access
 
         # Resolve progress callback (may be a factory that needs runtime context)
         resolved_callback = self._resolve_progress_callback(tool_context)
 
-        response = await session.call_tool(
-            self._mcp_tool.name,
-            arguments=args,
-            progress_callback=resolved_callback,
-            meta=meta_trace_context,
+    # 2.x-only field. Acting on it (`input_required` drives elicitation) is a
+    # feature, not compatibility. Not dropped on 1.x, where a key of that name
+    # could only be a server extra.
+    if IS_MCP_SDK_V2:
+      result.pop("resultType", None)
+
+    # Push UI widget to the event actions if the tool supports it. Dump the
+    # tool: `payload` is a plain dict, so a model left in it gets serialized by
+    # whichever sink writes the event, and the sinks disagree -- `inputSchema`
+    # from those passing `by_alias`, `input_schema` from the session stores.
+    if self.mcp_app_resource_uri:
+      # Tests and external subclasses pass duck-typed tools that cannot be
+      # dumped. Pass those through rather than fail a call that succeeded.
+      tool_payload: Any = self._mcp_tool
+      if hasattr(tool_payload, "model_dump"):
+        tool_payload = _dump_mcp_model(tool_payload)
+      tool_context.render_ui_widget(
+          UiWidget(
+              id=tool_context.function_call_id,
+              provider="mcp",
+              payload={
+                  "resource_uri": self.mcp_app_resource_uri,
+                  "tool": tool_payload,
+                  "tool_args": args,
+              },
+          )
+      )
+    return result
+
+  def _detect_error_in_response(self, response: Any) -> str | None:
+    """Telemetry hook: returns an error type if the response indicates an error."""
+    # `response` is a dumped CallToolResult. `_run_async_impl` restores
+    # `isError`, but this hook also sees dumps made elsewhere, which keep
+    # whichever spelling their SDK used. Missing one silently stops reporting
+    # tool errors, so read both.
+    if isinstance(response, dict) and (
+        response.get("isError") or response.get("is_error")
+    ):
+      return "MCP_TOOL_ERROR"
+    return None
+
+  def _resolve_progress_callback(
+      self, tool_context: ToolContext
+  ) -> ProgressFnT | None:
+    """Resolve the progress callback for the current invocation.
+
+    If progress_callback is a ProgressCallbackFactory, call it to create
+    a callback with runtime context. Otherwise, return the callback directly.
+
+    Args:
+      tool_context: The tool context for the current invocation.
+
+    Returns:
+      The resolved progress callback, or None if not configured.
+    """
+    if (
+        not hasattr(self, "_progress_callback")
+        or self._progress_callback is None
+    ):
+      return None
+
+    # A ProgressFnT is an async callable; a ProgressCallbackFactory is a plain
+    # one that returns an async callable.
+    #
+    # The casts carry that decision to the type checker, which cannot narrow a
+    # union on a call like this. They became necessary once ADK declared
+    # `ProgressFnT` itself: while it came from the SDK the annotation resolved
+    # to `Any` here and every branch type-checked vacuously.
+    if _is_async_callable(self._progress_callback):
+      return cast(ProgressFnT, self._progress_callback)
+
+    if callable(self._progress_callback):
+      factory = cast(ProgressCallbackFactory, self._progress_callback)
+      return factory(self.name, callback_context=tool_context)
+
+    return cast(ProgressFnT, self._progress_callback)
+
+  async def _get_headers(
+      self, tool_context: ToolContext, credential: AuthCredential
+  ) -> dict[str, str] | None:
+    """Extracts authentication headers from credentials.
+
+    Args:
+        tool_context: The tool context of the current invocation.
+        credential: The authentication credential to process.
+
+    Returns:
+        Dictionary of headers to add to the request, or None if no auth.
+
+    Raises:
+        ValueError: If API key authentication is configured for non-header
+        location.
+    """
+    headers: dict[str, str] | None = None
+    if credential:
+      if credential.oauth2:
+        headers = {"Authorization": f"Bearer {credential.oauth2.access_token}"}
+      elif credential.http:
+        # Handle HTTP authentication schemes
+        if (
+            credential.http.scheme.lower() == "bearer"
+            and credential.http.credentials.token
+        ):
+          headers = {
+              "Authorization": f"Bearer {credential.http.credentials.token}"
+          }
+        elif credential.http.scheme.lower() == "basic":
+          # Handle basic auth
+          if (
+              credential.http.credentials.username
+              and credential.http.credentials.password
+          ):
+
+            credentials = f"{credential.http.credentials.username}:{credential.http.credentials.password}"
+            encoded_credentials = base64.b64encode(
+                credentials.encode()
+            ).decode()
+            headers = {"Authorization": f"Basic {encoded_credentials}"}
+        elif credential.http.credentials.token:
+          # Handle other HTTP schemes with token
+          headers = {
+              "Authorization": (
+                  f"{credential.http.scheme}"
+                  f" {credential.http.credentials.token}"
+              )
+          }
+        if credential.http.additional_headers:
+          headers = headers or {}
+          headers.update(credential.http.additional_headers)
+      elif credential.api_key:
+        if (
+            not self._credentials_manager
+            or not self._credentials_manager._auth_config
+        ):
+          error_msg = (
+              "Cannot find corresponding auth scheme for API key credential."
+          )
+          logger.error(error_msg)
+          raise ValueError(error_msg)
+        else:
+          # `in_` and `name` are declared on APIKey; a CustomAuthScheme may
+          # carry them too, so read them off the scheme rather than requiring
+          # an APIKey instance. A scheme with neither used to raise
+          # AttributeError here.
+          scheme = self._credentials_manager._auth_config.auth_scheme
+          key_location = getattr(scheme, "in_", None)
+          key_name = getattr(scheme, "name", None)
+          if key_location != APIKeyIn.header:
+            error_msg = (
+                "McpTool only supports header-based API key authentication."
+                f" Configured location: {key_location} (scheme:"
+                f" {type(scheme).__name__})"
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+          if not isinstance(key_name, str):
+            error_msg = (
+                "API key auth scheme"
+                f" {type(scheme).__name__} carries no header name."
+            )
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+          headers = {key_name: credential.api_key}
+      elif credential.service_account:
+        # Service accounts should be exchanged for access tokens before reaching this point
+        logger.warning(
+            "Service account credentials should be exchanged before MCP"
+            " session creation"
         )
         result = response.model_dump(exclude_none=True, mode="json")
 

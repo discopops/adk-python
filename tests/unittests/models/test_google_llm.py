@@ -12,6 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
+import concurrent.futures
+from functools import cached_property
+import logging
 import sys
 from typing import Optional
 from unittest import mock
@@ -64,7 +68,890 @@ class MockAsyncIterator:
 
 @pytest.fixture
 def generate_content_response():
-    return types.GenerateContentResponse(
+  return types.GenerateContentResponse(
+      candidates=[
+          types.Candidate(
+              content=Content(
+                  role="model",
+                  parts=[Part.from_text(text="Hello, how can I help you?")],
+              ),
+              finish_reason=types.FinishReason.STOP,
+          )
+      ]
+  )
+
+
+@pytest.fixture
+def gemini_llm():
+  return Gemini(model="gemini-2.5-flash")
+
+
+@pytest.fixture
+def llm_request():
+  return LlmRequest(
+      model="gemini-2.5-flash",
+      contents=[Content(role="user", parts=[Part.from_text(text="Hello")])],
+      config=types.GenerateContentConfig(
+          temperature=0.1,
+          response_modalities=[types.Modality.TEXT],
+          system_instruction="You are a helpful assistant",
+      ),
+  )
+
+
+@pytest.fixture
+def cache_metadata():
+  import time
+
+  return CacheMetadata(
+      cache_name="projects/test/locations/us-central1/cachedContents/test123",
+      expire_time=time.time() + 3600,
+      fingerprint="test_fingerprint",
+      invocations_used=2,
+      contents_count=3,
+      created_at=time.time() - 600,
+  )
+
+
+@pytest.fixture
+def llm_request_with_cache(cache_metadata):
+  return LlmRequest(
+      model="gemini-2.5-flash",
+      contents=[Content(role="user", parts=[Part.from_text(text="Hello")])],
+      config=types.GenerateContentConfig(
+          temperature=0.1,
+          response_modalities=[types.Modality.TEXT],
+          system_instruction="You are a helpful assistant",
+      ),
+      cache_config=ContextCacheConfig(
+          cache_intervals=10, ttl_seconds=3600, min_tokens=100
+      ),
+      cache_metadata=cache_metadata,
+  )
+
+
+@pytest.fixture
+def llm_request_with_computer_use():
+  return LlmRequest(
+      model="gemini-2.5-flash",
+      contents=[Content(role="user", parts=[Part.from_text(text="Hello")])],
+      config=types.GenerateContentConfig(
+          temperature=0.1,
+          response_modalities=[types.Modality.TEXT],
+          system_instruction="You are a helpful assistant",
+          tools=[
+              types.Tool(
+                  computer_use=types.ComputerUse(
+                      environment=types.Environment.ENVIRONMENT_BROWSER
+                  )
+              )
+          ],
+      ),
+  )
+
+
+def test_supported_models():
+  models = Gemini.supported_models()
+  assert len(models) == 5
+  assert models[0] == r"gemini-.*"
+  assert models[1] == r"gemma-4.*"
+  assert models[2] == r"model-optimizer-.*"
+  assert models[3] == r"projects\/.+\/locations\/.+\/endpoints\/.+"
+  assert (
+      models[4]
+      == r"projects\/.+\/locations\/.+\/publishers\/google\/models\/gemini.+"
+  )
+
+
+def test_gemini_api_client_creation_with_projects_prefix():
+  model = Gemini(
+      model="projects/test-project/locations/test-location/publishers/google/models/gemini-2.5-pro"
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model.api_client
+    mock_client.assert_called_once()
+    _, kwargs = mock_client.call_args
+    assert kwargs["enterprise"] is True
+    assert "project" not in kwargs
+    assert "location" not in kwargs
+
+
+def test_gemini_live_api_client_creation_with_projects_prefix():
+  model = Gemini(
+      model="projects/test-project/locations/test-location/publishers/google/models/gemini-2.5-pro"
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model._live_api_client
+    assert mock_client.call_count == 2
+
+    # Second call is for _live_api_client
+    _, kwargs = mock_client.call_args_list[1]
+    assert kwargs["enterprise"] is True
+
+
+def test_gemini_api_client_creation_with_client_kwargs():
+  mock_credentials = mock.MagicMock()
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={
+          "enterprise": True,
+          "project": "my-project",
+          "location": "my-location",
+          "api_key": "my-key",
+          "credentials": mock_credentials,
+      },
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model.api_client
+    mock_client.assert_called_once()
+    _, kwargs = mock_client.call_args
+    assert kwargs["enterprise"] is True
+    assert kwargs["project"] == "my-project"
+    assert kwargs["location"] == "my-location"
+    assert kwargs["api_key"] == "my-key"
+    assert kwargs["credentials"] == mock_credentials
+
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model._live_api_client
+    mock_client.assert_called_once()
+    _, kwargs = mock_client.call_args
+    assert kwargs["enterprise"] is True
+    assert kwargs["project"] == "my-project"
+    assert kwargs["location"] == "my-location"
+    assert kwargs["api_key"] == "my-key"
+    assert kwargs["credentials"] == mock_credentials
+
+
+def test_gemini_api_client_skips_gcp_defaults_when_client_kwargs_has_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "meta-project",
+  )
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={"api_key": "my-key", "enterprise": True},
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model.api_client
+  mock_client.assert_called_once()
+  _, kwargs = mock_client.call_args
+  assert kwargs.get("api_key") == "my-key"
+  assert kwargs.get("enterprise") is True
+  assert "project" not in kwargs
+
+
+def test_gemini_api_client_skips_gcp_defaults_without_enterprise_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "meta-project",
+  )
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={"location": "us-central1"},
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model.api_client
+  mock_client.assert_called_once()
+  _, kwargs = mock_client.call_args
+  assert "enterprise" not in kwargs
+  assert "project" not in kwargs
+  assert kwargs.get("location") == "us-central1"
+
+
+def test_gemini_api_client_calls_gcp_defaults_with_enterprise_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "meta-project",
+  )
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={"enterprise": True, "location": "us-central1"},
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model.api_client
+  mock_client.assert_called_once()
+  _, kwargs = mock_client.call_args
+  assert kwargs.get("enterprise") is True
+  assert kwargs.get("project") == "meta-project"
+  assert kwargs.get("location") == "us-central1"
+
+
+def test_gemini_api_client_skips_gcp_defaults_when_client_kwargs_has_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "meta-project",
+  )
+  mock_creds = mock.MagicMock()
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={"credentials": mock_creds, "enterprise": True},
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model.api_client
+  mock_client.assert_called_once()
+  _, kwargs = mock_client.call_args
+  assert kwargs.get("credentials") == mock_creds
+  assert kwargs.get("enterprise") is True
+  assert "project" not in kwargs
+
+
+def test_gemini_api_client_skips_gcp_defaults_when_application_credentials_in_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/path/to/key.json")
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "meta-project",
+  )
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={"enterprise": True},
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model.api_client
+  mock_client.assert_called_once()
+  _, kwargs = mock_client.call_args
+  assert kwargs.get("enterprise") is True
+  assert "project" not in kwargs
+
+
+def test_gemini_live_api_client_skips_gcp_defaults_when_client_kwargs_has_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "meta-project",
+  )
+  model = Gemini(
+      model="gemini-2.5-flash",
+      base_url="https://generativelanguage.googleapis.com/v1alpha",
+      client_kwargs={"api_key": "my-key", "enterprise": True},
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model._live_api_client
+  mock_client.assert_called_once()
+  _, kwargs = mock_client.call_args
+  assert kwargs.get("api_key") == "my-key"
+  assert kwargs.get("enterprise") is True
+  assert "project" not in kwargs
+
+
+def test_gemini_live_api_client_skips_gcp_defaults_without_enterprise_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "meta-project",
+  )
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={"location": "us-central1"},
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model._live_api_client
+  assert mock_client.call_count == 2
+  _, kwargs = mock_client.call_args_list[1]
+  assert "enterprise" not in kwargs
+  assert "project" not in kwargs
+  assert kwargs.get("location") == "us-central1"
+
+
+def test_gemini_live_api_client_calls_gcp_defaults_with_enterprise_mode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "meta-project",
+  )
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={"enterprise": True, "location": "us-central1"},
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model._live_api_client
+  assert mock_client.call_count == 2
+  _, kwargs = mock_client.call_args_list[1]
+  assert kwargs.get("enterprise") is True
+  assert kwargs.get("project") == "meta-project"
+  assert kwargs.get("location") == "us-central1"
+
+
+def test_gemini_live_api_client_skips_gcp_defaults_when_client_kwargs_has_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "meta-project",
+  )
+  mock_creds = mock.MagicMock()
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={"credentials": mock_creds, "enterprise": True},
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model._live_api_client
+  assert mock_client.call_count == 2
+  _, kwargs = mock_client.call_args_list[1]
+  assert kwargs.get("credentials") == mock_creds
+  assert kwargs.get("enterprise") is True
+  assert "project" not in kwargs
+
+
+def test_gemini_live_api_client_skips_gcp_defaults_when_application_credentials_in_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/path/to/key.json")
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "meta-project",
+  )
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={"enterprise": True},
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model._live_api_client
+  assert mock_client.call_count == 2
+  _, kwargs = mock_client.call_args_list[1]
+  assert kwargs.get("enterprise") is True
+  assert "project" not in kwargs
+
+
+def test_gemini_serialization_excludes_client_kwargs():
+  mock_credentials = mock.MagicMock()
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={
+          "enterprise": True,
+          "credentials": mock_credentials,
+      },
+  )
+  dumped = model.model_dump()
+  assert "client_kwargs" not in dumped
+
+
+def test_gemini_repr_excludes_client_kwargs():
+  mock_credentials = mock.MagicMock()
+  model = Gemini(
+      model="gemini-2.5-flash",
+      client_kwargs={
+          "enterprise": True,
+          "credentials": mock_credentials,
+      },
+  )
+  repr_str = repr(model)
+  assert "client_kwargs" not in repr_str
+
+
+def test_gemini_api_client_when_client_kwargs_missing_from_dict():
+  model = Gemini(model="gemini-2.5-flash")
+  model.__dict__.pop("client_kwargs", None)
+  assert "client_kwargs" not in model.__dict__
+
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model.api_client
+    mock_client.assert_called_once()
+
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model._live_api_client
+    mock_client.assert_called_once()
+
+
+def _in_new_event_loop(read):
+  """Reads inside a fresh event loop, the way the synchronous Runner does."""
+
+  async def _call():
+    return read()
+
+  return asyncio.run(_call())
+
+
+@pytest.mark.parametrize("attribute", ["api_client", "_live_api_client"])
+def test_client_is_built_once_per_event_loop(attribute):
+  model = Gemini(model="gemini-2.5-flash")
+
+  def read():
+    return getattr(model, attribute)
+
+  with mock.patch(
+      "google.genai.Client", side_effect=lambda **kwargs: mock.MagicMock()
+  ):
+    first = _in_new_event_loop(read)
+    second = _in_new_event_loop(read)
+    within_one_loop = _in_new_event_loop(lambda: (read(), read()))
+
+  assert first is not second
+  assert within_one_loop[0] is within_one_loop[1]
+
+
+def test_api_client_survives_concurrent_reads_from_many_threads():
+  model = Gemini(model="gemini-2.5-flash")
+  thread_count = 8
+  without_a_loop = []
+
+  def hammer():
+    for _ in range(20):
+      # A read with no running loop shares one entry with every other
+      # thread, so these contend on a single key while the reads below
+      # insert and evict keys of their own.
+      without_a_loop.append(model.api_client)
+      _in_new_event_loop(lambda: model.api_client)
+
+  with mock.patch(
+      "google.genai.Client", side_effect=lambda **kwargs: mock.MagicMock()
+  ):
+    # One worker per hammer, so all of them really do run at once.
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=thread_count
+    ) as executor:
+      futures = [executor.submit(hammer) for _ in range(thread_count)]
+      # Every result is retrieved, so an exception in any thread fails
+      # the test.
+      for future in futures:
+        future.result()
+
+  assert len(set(id(client) for client in without_a_loop)) == 1
+
+
+def test_api_client_can_be_overridden_on_the_instance():
+  model = Gemini(model="gemini-2.5-flash")
+  with mock.patch(
+      "google.genai.Client", side_effect=lambda **kwargs: mock.MagicMock()
+  ):
+    with mock.patch.object(model, "api_client") as replacement:
+      assert model.api_client is replacement
+      assert _in_new_event_loop(lambda: model.api_client) is replacement
+
+    assert model.api_client is not replacement
+    assert model.api_client is model.api_client
+
+
+def test_api_client_can_be_overridden_by_a_subclass():
+
+  class SubclassGemini(Gemini):
+
+    @cached_property
+    def api_client(self):
+      return mock.MagicMock()
+
+  model = SubclassGemini(model="gemini-2.5-flash")
+  assert model.api_client is model.api_client
+  assert _in_new_event_loop(lambda: model.api_client) is model.api_client
+
+
+def test_client_version_header():
+  model = Gemini(model="gemini-2.5-flash")
+  client = model.api_client
+
+  # Check that ADK version and Python version are present in headers
+  adk_version_string = f"google-adk/{adk_version.__version__}"
+  python_version_string = f"gl-python/{sys.version.split()[0]}"
+
+  x_goog_api_client_header = client._api_client._http_options.headers[
+      "x-goog-api-client"
+  ]
+  user_agent_header = client._api_client._http_options.headers["user-agent"]
+
+  # Verify ADK version is present
+  assert adk_version_string in x_goog_api_client_header
+  assert adk_version_string in user_agent_header
+
+  # Verify Python version is present
+  assert python_version_string in x_goog_api_client_header
+  assert python_version_string in user_agent_header
+
+  # Verify some Google SDK version is present (could be genai-sdk or vertex-genai-modules)
+  assert any(
+      sdk in x_goog_api_client_header
+      for sdk in ["google-genai-sdk/", "vertex-genai-modules/"]
+  )
+  assert any(
+      sdk in user_agent_header
+      for sdk in ["google-genai-sdk/", "vertex-genai-modules/"]
+  )
+
+
+def test_client_version_header_with_agent_engine(monkeypatch):
+  monkeypatch.setenv(
+      _AGENT_ENGINE_TELEMETRY_ENV_VARIABLE_NAME, "my_test_project"
+  )
+  model = Gemini(model="gemini-2.5-flash")
+  client = model.api_client
+
+  # Check that ADK version with telemetry tag and Python version are present in
+  # headers
+  adk_version_with_telemetry = (
+      f"google-adk/{adk_version.__version__}+{_AGENT_ENGINE_TELEMETRY_TAG}"
+  )
+  python_version_string = f"gl-python/{sys.version.split()[0]}"
+
+  x_goog_api_client_header = client._api_client._http_options.headers[
+      "x-goog-api-client"
+  ]
+  user_agent_header = client._api_client._http_options.headers["user-agent"]
+
+  # Verify ADK version with telemetry tag is present
+  assert adk_version_with_telemetry in x_goog_api_client_header
+  assert adk_version_with_telemetry in user_agent_header
+
+  # Verify Python version is present
+  assert python_version_string in x_goog_api_client_header
+  assert python_version_string in user_agent_header
+
+  # Verify some Google SDK version is present (could be genai-sdk or vertex-genai-modules)
+  assert any(
+      sdk in x_goog_api_client_header
+      for sdk in ["google-genai-sdk/", "vertex-genai-modules/"]
+  )
+  assert any(
+      sdk in user_agent_header
+      for sdk in ["google-genai-sdk/", "vertex-genai-modules/"]
+  )
+
+
+def test_api_client_uses_api_version_from_google_base_url():
+  model = Gemini(
+      model="gemini-2.5-flash",
+      base_url="https://generativelanguage.googleapis.com/v1alpha",
+  )
+
+  client = model.api_client
+
+  assert client._api_client._http_options.base_url == (
+      "https://generativelanguage.googleapis.com/"
+  )
+  assert client._api_client._http_options.api_version == "v1alpha"
+
+
+def test_api_client_preserves_custom_base_url_path():
+  model = Gemini(
+      model="gemini-2.5-flash",
+      base_url="https://proxy.example.com/gemini/v1alpha",
+  )
+
+  client = model.api_client
+
+  assert client._api_client._http_options.base_url == (
+      "https://proxy.example.com/gemini/v1alpha"
+  )
+  # Non-Google base URLs aren't normalized, so the SDK's default api_version
+  # ("v1beta") applies even though the URL path looks like a version suffix.
+  assert client._api_client._http_options.api_version == "v1beta"
+
+
+def test_api_client_default_api_version_unchanged(monkeypatch):
+  """Without configuration, ADK does not force an api_version (SDK default)."""
+  monkeypatch.delenv("GOOGLE_GENAI_API_VERSION", raising=False)
+  model = Gemini(model="gemini-2.5-flash")
+
+  # ADK leaves api_version unset so the google-genai SDK applies its own
+  # default (v1beta1 for Vertex AI), preserving existing behavior.
+  assert model._base_url_and_api_version == (None, None)
+  client = model.api_client
+  assert client._api_client._http_options.api_version == "v1beta"
+
+
+def test_api_client_uses_api_version_field():
+  """The api_version field flows into the constructed client's http_options."""
+  model = Gemini(model="gemini-2.5-flash", api_version="v1")
+
+  client = model.api_client
+
+  assert client._api_client._http_options.api_version == "v1"
+
+
+def test_api_client_uses_api_version_env_var(monkeypatch):
+  """The GOOGLE_GENAI_API_VERSION env var flows into http_options."""
+  monkeypatch.setenv("GOOGLE_GENAI_API_VERSION", "v1")
+  model = Gemini(model="gemini-2.5-flash")
+
+  client = model.api_client
+
+  assert client._api_client._http_options.api_version == "v1"
+
+
+def test_api_version_field_overrides_env_var(monkeypatch):
+  """The explicit api_version field takes precedence over the env var."""
+  monkeypatch.setenv("GOOGLE_GENAI_API_VERSION", "v1beta1")
+  model = Gemini(model="gemini-2.5-flash", api_version="v1")
+
+  client = model.api_client
+
+  assert client._api_client._http_options.api_version == "v1"
+
+
+def test_base_url_api_version_overrides_field():
+  """A version embedded in base_url wins over the api_version field."""
+  model = Gemini(
+      model="gemini-2.5-flash",
+      base_url="https://generativelanguage.googleapis.com/v1alpha",
+      api_version="v1",
+  )
+
+  client = model.api_client
+
+  assert client._api_client._http_options.base_url == (
+      "https://generativelanguage.googleapis.com/"
+  )
+  assert client._api_client._http_options.api_version == "v1alpha"
+
+
+def test_maybe_append_user_content(gemini_llm, llm_request):
+  # Test with user content already present
+  gemini_llm._maybe_append_user_content(llm_request)
+  assert len(llm_request.contents) == 1
+
+  # Test with model content as the last message
+  llm_request.contents.append(
+      Content(role="model", parts=[Part.from_text(text="Response")])
+  )
+  gemini_llm._maybe_append_user_content(llm_request)
+  assert len(llm_request.contents) == 3
+  assert llm_request.contents[-1].role == "user"
+  assert "Continue processing" in llm_request.contents[-1].parts[0].text
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async(
+    gemini_llm, llm_request, generate_content_response
+):
+  with mock.patch.object(gemini_llm, "api_client") as mock_client:
+    # Create a mock coroutine that returns the generate_content_response
+    async def mock_coro():
+      return generate_content_response
+
+    # Assign the coroutine to the mocked method
+    mock_client.aio.models.generate_content.return_value = mock_coro()
+
+    responses = [
+        resp
+        async for resp in gemini_llm.generate_content_async(
+            llm_request, stream=False
+        )
+    ]
+
+    assert len(responses) == 1
+    assert isinstance(responses[0], LlmResponse)
+    assert responses[0].content.parts[0].text == "Hello, how can I help you?"
+    mock_client.aio.models.generate_content.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_multiple_candidates_logs_error(
+    gemini_llm, llm_request, generate_content_response, caplog
+):
+  generate_content_response.candidates = [
+      types.Candidate(
+          content=Content(
+              role="model", parts=[Part.from_text(text="First candidate")]
+          ),
+          finish_reason=types.FinishReason.STOP,
+      ),
+      types.Candidate(
+          content=Content(
+              role="model", parts=[Part.from_text(text="Second candidate")]
+          ),
+          finish_reason=types.FinishReason.STOP,
+      ),
+  ]
+
+  with mock.patch.object(gemini_llm, "api_client") as mock_client:
+
+    async def mock_coro():
+      return generate_content_response
+
+    mock_client.aio.models.generate_content.return_value = mock_coro()
+
+    with caplog.at_level(logging.ERROR):
+      responses = [
+          response
+          async for response in gemini_llm.generate_content_async(
+              llm_request, stream=False
+          )
+      ]
+
+    mock_client.aio.models.generate_content.assert_called_once()
+    assert len(responses) == 1
+    assert responses[0].content.parts[0].text == "First candidate"
+    errors = [
+        record
+        for record in caplog.records
+        if "Multiple candidates found in response" in record.getMessage()
+    ]
+    assert len(errors) == 1
+    assert errors[0].name == "google_adk.google.adk.models.google_llm"
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_stream_multiple_candidates_logs_error(
+    gemini_llm, llm_request, caplog
+):
+  with mock.patch.object(gemini_llm, "api_client") as mock_client:
+    mock_responses = [
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    content=Content(
+                        role="model", parts=[Part.from_text(text=first)]
+                    ),
+                    finish_reason=None,
+                ),
+                types.Candidate(
+                    content=Content(
+                        role="model", parts=[Part.from_text(text=second)]
+                    ),
+                    finish_reason=None,
+                ),
+            ]
+        )
+        for first, second in (("Hello", "World"), ("Hello2", "World2"))
+    ]
+
+    async def mock_coro():
+      return MockAsyncIterator(mock_responses)
+
+    mock_client.aio.models.generate_content_stream.return_value = mock_coro()
+
+    with caplog.at_level(logging.ERROR):
+      _ = [
+          response
+          async for response in gemini_llm.generate_content_async(
+              llm_request, stream=True
+          )
+      ]
+
+    errors = [
+        record
+        for record in caplog.records
+        if "Multiple candidates found in streaming response"
+        in record.getMessage()
+    ]
+    assert len(errors) == 1
+    assert errors[0].name == "google_adk.google.adk.models.google_llm"
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_stream(gemini_llm, llm_request):
+  with mock.patch.object(gemini_llm, "api_client") as mock_client:
+    mock_responses = [
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    content=Content(
+                        role="model", parts=[Part.from_text(text="Hello")]
+                    ),
+                    finish_reason=None,
+                )
+            ]
+        ),
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    content=Content(
+                        role="model", parts=[Part.from_text(text=", how")]
+                    ),
+                    finish_reason=None,
+                )
+            ]
+        ),
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    content=Content(
+                        role="model",
+                        parts=[Part.from_text(text=" can I help you?")],
+                    ),
+                    finish_reason=types.FinishReason.STOP,
+                )
+            ]
+        ),
+    ]
+
+    # Create a mock coroutine that returns the MockAsyncIterator
+    async def mock_coro():
+      return MockAsyncIterator(mock_responses)
+
+    # Set the mock to return the coroutine
+    mock_client.aio.models.generate_content_stream.return_value = mock_coro()
+
+    responses = [
+        resp
+        async for resp in gemini_llm.generate_content_async(
+            llm_request, stream=True
+        )
+    ]
+
+    # Assertions remain the same
+    assert len(responses) == 4
+    assert responses[0].partial is True
+    assert responses[1].partial is True
+    assert responses[2].partial is True
+    assert responses[3].content.parts[0].text == "Hello, how can I help you?"
+    mock_client.aio.models.generate_content_stream.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_stream_preserves_thinking_and_text_parts(
+    gemini_llm, llm_request
+):
+  with mock.patch.object(gemini_llm, "api_client") as mock_client:
+    response1 = types.GenerateContentResponse(
         candidates=[
             types.Candidate(
                 content=Content(
@@ -2222,6 +3109,322 @@ async def test_connect_speech_config_remains_none_when_both_are_none(
             call_args = mock_live_client.aio.live.connect.call_args
             config_arg = call_args.kwargs["config"]
 
-            # Verify the final speech_config is still None
-            assert config_arg.speech_config is None
-            assert isinstance(connection, GeminiLlmConnection)
+      async with gemini_llm.connect(llm_request):
+        pass
+
+  assert sentinel not in caplog.text
+  # The header is still forwarded to the live API, only the log omits it.
+  config_arg = mock_live_client.aio.live.connect.call_args.kwargs["config"]
+  assert (
+      config_arg.http_options.headers["Authorization"] == f"Bearer {sentinel}"
+  )
+  # The log is still emitted and still useful.
+  assert "gemini-2.5-flash" in caplog.text
+  assert "Modality.AUDIO" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_stream_secondary_candidate_chunk(
+    gemini_llm, llm_request, caplog
+):
+  """Test a candidate streamed in its own chunk is detected and skipped."""
+  with mock.patch.object(gemini_llm, "api_client") as mock_client:
+    mock_responses = [
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    index=0,
+                    content=Content(
+                        role="model", parts=[Part.from_text(text="Hello")]
+                    ),
+                    finish_reason=None,
+                )
+            ]
+        ),
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    index=1,
+                    content=Content(
+                        role="model", parts=[Part.from_text(text="Other")]
+                    ),
+                    finish_reason=None,
+                )
+            ]
+        ),
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    index=0,
+                    content=Content(
+                        role="model", parts=[Part.from_text(text=" world")]
+                    ),
+                    finish_reason=types.FinishReason.STOP,
+                )
+            ]
+        ),
+    ]
+
+    async def mock_coro():
+      return MockAsyncIterator(mock_responses)
+
+    mock_client.aio.models.generate_content_stream.return_value = mock_coro()
+
+    with caplog.at_level(logging.ERROR):
+      responses = [
+          response
+          async for response in gemini_llm.generate_content_async(
+              llm_request, stream=True
+          )
+      ]
+
+    assert responses[-1].content.parts[0].text == "Hello world"
+    errors = [
+        record
+        for record in caplog.records
+        if "Multiple candidates found in streaming response"
+        in record.getMessage()
+    ]
+    assert len(errors) == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_stream_secondary_candidate_chunk_is_skipped(
+    gemini_llm, llm_request
+):
+  """Test a chunk holding only secondary candidates yields no partial response."""
+  with mock.patch.object(gemini_llm, "api_client") as mock_client:
+    mock_responses = [
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    index=0,
+                    content=Content(
+                        role="model", parts=[Part.from_text(text="Hello")]
+                    ),
+                    finish_reason=None,
+                )
+            ]
+        ),
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    index=1,
+                    content=Content(
+                        role="model", parts=[Part.from_text(text="Other")]
+                    ),
+                    finish_reason=None,
+                )
+            ]
+        ),
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    index=0,
+                    content=Content(
+                        role="model", parts=[Part.from_text(text=" world")]
+                    ),
+                    finish_reason=types.FinishReason.STOP,
+                )
+            ]
+        ),
+    ]
+
+    async def mock_coro():
+      return MockAsyncIterator(mock_responses)
+
+    mock_client.aio.models.generate_content_stream.return_value = mock_coro()
+
+    responses = [
+        response
+        async for response in gemini_llm.generate_content_async(
+            llm_request, stream=True
+        )
+    ]
+
+    assert len(responses) == 3
+    assert [r.content.parts[0].text for r in responses] == [
+        "Hello",
+        " world",
+        "Hello world",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_generate_content_async_stream_secondary_candidate_chunk_preserves_usage_metadata(
+    gemini_llm, llm_request
+):
+  """Test that usage metadata on a chunk holding only secondary candidates is preserved."""
+  with mock.patch.object(gemini_llm, "api_client") as mock_client:
+    mock_responses = [
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    index=0,
+                    content=Content(
+                        role="model", parts=[Part.from_text(text="Hello")]
+                    ),
+                    finish_reason=None,
+                )
+            ]
+        ),
+        types.GenerateContentResponse(
+            candidates=[
+                types.Candidate(
+                    index=1,
+                    content=Content(
+                        role="model", parts=[Part.from_text(text="Other")]
+                    ),
+                    finish_reason=types.FinishReason.STOP,
+                )
+            ],
+            usage_metadata=types.GenerateContentResponseUsageMetadata(
+                prompt_token_count=10,
+                candidates_token_count=5,
+                total_token_count=15,
+            ),
+        ),
+    ]
+
+    async def mock_coro():
+      return MockAsyncIterator(mock_responses)
+
+    mock_client.aio.models.generate_content_stream.return_value = mock_coro()
+
+    responses = [
+        response
+        async for response in gemini_llm.generate_content_async(
+            llm_request, stream=True
+        )
+    ]
+
+    assert responses[-1].usage_metadata is not None
+    assert responses[-1].usage_metadata.total_token_count == 15
+
+
+@pytest.mark.asyncio
+async def test_interactions_api_forwards_request_service_tier(llm_request):
+  """The tier the run asked for reaches the interactions transport."""
+  gemini = Gemini(model="gemini-2.5-flash", use_interactions_api=True)
+  llm_request.service_tier = "deferred"
+  captured = {}
+
+  async def fake_generate(**kwargs):
+    captured.update(kwargs)
+    yield LlmResponse(
+        content=Content(role="model", parts=[Part.from_text(text="ok")])
+    )
+
+  with (
+      mock.patch.object(gemini, "_preprocess_request", new=AsyncMock()),
+      mock.patch(
+          "google.adk.models.interactions_utils.generate_content_via_interactions",
+          new=fake_generate,
+      ),
+  ):
+    responses = [
+        response
+        async for response in gemini.generate_content_async(llm_request)
+    ]
+
+  assert responses[0].content.parts[0].text == "ok"
+  assert captured["service_tier"] == "deferred"
+
+
+@pytest.mark.asyncio
+async def test_interactions_api_forwards_no_tier_when_unset(llm_request):
+  """An untiered run forwards None rather than inventing a tier."""
+  gemini = Gemini(model="gemini-2.5-flash", use_interactions_api=True)
+  captured = {}
+
+  async def fake_generate(**kwargs):
+    captured.update(kwargs)
+    yield LlmResponse(
+        content=Content(role="model", parts=[Part.from_text(text="ok")])
+    )
+
+  with (
+      mock.patch.object(gemini, "_preprocess_request", new=AsyncMock()),
+      mock.patch(
+          "google.adk.models.interactions_utils.generate_content_via_interactions",
+          new=fake_generate,
+      ),
+  ):
+    _ = [
+        response
+        async for response in gemini.generate_content_async(llm_request)
+    ]
+
+  assert captured["service_tier"] is None
+
+
+@pytest.mark.parametrize(
+    "enterprise_env,client_kwargs",
+    [
+        ("true", None),
+        (None, {"enterprise": True}),
+    ],
+)
+def test_gemini_api_client_with_projects_prefix_does_not_inject_metadata_project(
+    monkeypatch: pytest.MonkeyPatch,
+    enterprise_env: str | None,
+    client_kwargs: dict | None,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  if enterprise_env:
+    monkeypatch.setenv("GOOGLE_GENAI_USE_ENTERPRISE", enterprise_env)
+  else:
+    monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "host-metadata-project",
+  )
+  model = Gemini(
+      model="projects/test-project/locations/test-location/publishers/google/models/gemini-2.5-pro",
+      client_kwargs=client_kwargs,
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model.api_client
+  mock_client.assert_called_once()
+  _, kwargs = mock_client.call_args
+  assert kwargs.get("enterprise") is True
+  assert "project" not in kwargs
+
+
+@pytest.mark.parametrize(
+    "enterprise_env,client_kwargs",
+    [
+        ("true", None),
+        (None, {"enterprise": True}),
+    ],
+)
+def test_gemini_live_api_client_with_projects_prefix_does_not_inject_metadata_project(
+    monkeypatch: pytest.MonkeyPatch,
+    enterprise_env: str | None,
+    client_kwargs: dict | None,
+):
+  monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+  monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+  monkeypatch.delenv("GOOGLE_CLOUD_PROJECT", raising=False)
+  if enterprise_env:
+    monkeypatch.setenv("GOOGLE_GENAI_USE_ENTERPRISE", enterprise_env)
+  else:
+    monkeypatch.delenv("GOOGLE_GENAI_USE_ENTERPRISE", raising=False)
+  monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+  monkeypatch.setattr(
+      "google.adk.utils._gcp_metadata.get_project_id_from_metadata",
+      lambda: "host-metadata-project",
+  )
+  model = Gemini(
+      model="projects/test-project/locations/test-location/publishers/google/models/gemini-2.5-pro",
+      client_kwargs=client_kwargs,
+  )
+  with mock.patch("google.genai.Client", autospec=True) as mock_client:
+    _ = model._live_api_client
+  assert mock_client.call_count == 2
+  _, kwargs = mock_client.call_args_list[1]
+  assert kwargs.get("enterprise") is True
+  assert "project" not in kwargs

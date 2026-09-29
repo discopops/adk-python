@@ -48,6 +48,8 @@ from ..base_toolset import ToolPredicate
 from ..load_mcp_resource_tool import LoadMcpResourceTool
 from ..tool_configs import BaseToolConfig
 from ..tool_configs import ToolArgsConfig
+from .mcp_session_manager import _http_debug_var
+from .mcp_session_manager import _is_session_terminated_error
 from .mcp_session_manager import MCPSessionManager
 from .mcp_session_manager import retry_on_errors
 from .mcp_session_manager import SseConnectionParams
@@ -193,164 +195,25 @@ class McpToolset(BaseToolset):
             if auth_scheme
             else None
         )
-        self._use_mcp_resources = use_mcp_resources
-
-    def _get_auth_headers(self) -> Optional[Dict[str, str]]:
-        """Build authentication headers from exchanged credential.
-
-        Returns:
-            Dictionary of auth headers, or None if no auth configured.
-        """
-        if (
-            not self._auth_config
-            or not self._auth_config.exchanged_auth_credential
-        ):
-            return None
-
-        credential = self._auth_config.exchanged_auth_credential
-        headers: Optional[Dict[str, str]] = None
-
-        if credential.oauth2:
-            headers = {
-                "Authorization": f"Bearer {credential.oauth2.access_token}"
-            }
-        elif credential.http:
-            # Handle HTTP authentication schemes
-            if (
-                credential.http.scheme.lower() == "bearer"
-                and credential.http.credentials
-                and credential.http.credentials.token
-            ):
-                headers = {
-                    "Authorization": f"Bearer {credential.http.credentials.token}"
-                }
-            elif credential.http.scheme.lower() == "basic":
-                # Handle basic auth
-                if (
-                    credential.http.credentials
-                    and credential.http.credentials.username
-                    and credential.http.credentials.password
-                ):
-                    credentials_str = (
-                        f"{credential.http.credentials.username}"
-                        f":{credential.http.credentials.password}"
-                    )
-                    encoded_credentials = base64.b64encode(
-                        credentials_str.encode()
-                    ).decode()
-                    headers = {"Authorization": f"Basic {encoded_credentials}"}
-            elif (
-                credential.http.credentials
-                and credential.http.credentials.token
-            ):
-                # Handle other HTTP schemes with token
-                headers = {
-                    "Authorization": (
-                        f"{credential.http.scheme} {credential.http.credentials.token}"
-                    )
-                }
-
-            if credential.http.additional_headers:
-                headers = headers or {}
-                headers.update(credential.http.additional_headers)
-        elif credential.api_key:
-            # For API key, use the auth scheme to determine header name
-            if self._auth_config.auth_scheme:
-                from fastapi.openapi.models import APIKeyIn
-
-                if hasattr(self._auth_config.auth_scheme, "in_"):
-                    if self._auth_config.auth_scheme.in_ == APIKeyIn.header:
-                        headers = {
-                            self._auth_config.auth_scheme.name: credential.api_key
-                        }
-                    else:
-                        logger.warning(
-                            "McpToolset only supports header-based API key authentication."
-                            " Configured location: %s",
-                            self._auth_config.auth_scheme.in_,
-                        )
-                else:
-                    # Default to using scheme name as header
-                    headers = {
-                        self._auth_config.auth_scheme.name: credential.api_key
-                    }
-
-        return headers
-
-    async def _execute_with_session(
-        self,
-        coroutine_func: Callable[[Any], Awaitable[T]],
-        error_message: str,
-        readonly_context: Optional[ReadonlyContext] = None,
-    ) -> T:
-        """Creates a session and executes a coroutine with it."""
-        headers: Dict[str, str] = {}
-
-        # Add headers from header_provider if available
-        if self._header_provider and readonly_context:
-            provider_headers = self._header_provider(readonly_context)
-            if provider_headers:
-                headers.update(provider_headers)
-
-        # Add auth headers from exchanged credential if available
-        auth_headers = self._get_auth_headers()
-        if auth_headers:
-            headers.update(auth_headers)
-
-        session = await self._mcp_session_manager.create_session(
-            headers=headers if headers else None
-        )
-        timeout_in_seconds = (
-            self._connection_params.timeout
-            if hasattr(self._connection_params, "timeout")
-            else None
-        )
-        try:
-            return await asyncio.wait_for(
-                coroutine_func(session), timeout=timeout_in_seconds
-            )
-        except Exception as e:
-            logger.exception(
-                f"Exception during MCP session execution: {error_message}: {e}"
-            )
-            raise ConnectionError(f"{error_message}: {e}") from e
-
-    @retry_on_errors
-    async def get_tools(
-        self,
-        readonly_context: Optional[ReadonlyContext] = None,
-    ) -> List[BaseTool]:
-        """Return all tools in the toolset based on the provided context.
-
-        Args:
-            readonly_context: Context used to filter tools available to the agent.
-              If None, all tools in the toolset are returned.
-
-        Returns:
-            List[BaseTool]: A list of tools available under the specified context.
-        """
-        # Fetch available tools from the MCP server
-        tools_response: ListToolsResult = await self._execute_with_session(
-            lambda session: session.list_tools(),
-            "Failed to get tools from MCP server",
-            readonly_context,
-        )
-
-        # Apply filtering based on context and tool_filter
-        tools = []
-        for tool in tools_response.tools:
-            mcp_tool = MCPTool(
-                mcp_tool=tool,
-                mcp_session_manager=self._mcp_session_manager,
-                auth_scheme=self._auth_scheme,
-                auth_credential=self._auth_credential,
-                require_confirmation=self._require_confirmation,
-                header_provider=self._header_provider,
-                progress_callback=(
-                    self._progress_callback
-                    if hasattr(self, "_progress_callback")
-                    else None
-                ),
+        # Drop the session the server has forgotten, so the retry from
+        # @retry_on_errors builds a fresh one instead of being handed the
+        # same dead session back.
+        if _is_session_terminated_error(e):
+          self._mcp_session_manager._discard_session(  # pylint: disable=protected-access
+              session_headers, session=session
+          )
+        raise ConnectionError(f"{error_message}: {e}") from e
+      finally:
+        self._mcp_session_manager._end_session_use(session_headers)  # pylint: disable=protected-access
+    finally:
+      if debug_token is not None:
+        _http_debug_var.reset(debug_token)
+        if current_debug and readonly_context is not None:
+          # pylint: disable=protected-access
+          inv_ctx = getattr(readonly_context, "_invocation_context", None)
+          if inv_ctx is not None:
+            inv_ctx._custom_metadata.setdefault("http_debug_info", []).extend(
+                current_debug
             )
 
             if self._is_tool_selected(mcp_tool, readonly_context):

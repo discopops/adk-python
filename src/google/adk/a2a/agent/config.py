@@ -110,15 +110,25 @@ class A2aRemoteAgentConfig(BaseModel):
 
     request_interceptors: Optional[list[RequestInterceptor]] = None
 
-    def __deepcopy__(self, memo):
-        cls = self.__class__
-        copied_values = {}
-        for k, v in self.__dict__.items():
-            if not k.startswith("_"):
-                if callable(v):
-                    copied_values[k] = v
-                else:
-                    copied_values[k] = copy.deepcopy(v, memo)
-        result = cls.model_construct(**copied_values)
-        memo[id(self)] = result
-        return result
+  card_request_interceptors: list[CardRequestInterceptor] | None = None
+  """Interceptors that inject headers into the remote agent card fetch."""
+
+  forward_session_id_as_context_id: bool = False
+  """Whether to forward the local session ID as context_id when no context_id is present."""
+
+  def __deepcopy__(
+      self, memo: dict[int, Any] | None = None
+  ) -> A2aRemoteAgentConfig:
+    if memo is None:
+      memo = {}
+    cls = self.__class__
+    copied_values: dict[str, Any] = {}
+    for k, v in self.__dict__.items():
+      if not k.startswith('_'):
+        if callable(v):
+          copied_values[k] = v
+        else:
+          copied_values[k] = copy.deepcopy(v, memo)
+    result = cls.model_construct(**copied_values)
+    memo[id(self)] = result
+    return cast(Self, result)

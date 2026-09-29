@@ -58,6 +58,18 @@ def _copy_session(session: Session) -> Session:
         return copy.deepcopy(session)
 
 
+def _copy_state(state: dict[str, Any]) -> dict[str, Any]:
+  """Copies state as deeply as _copy_session copies a session's own state.
+
+  Scoped state is no more reachable through the result than session state
+  is. Under IN_MEMORY_SESSION_SERVICE_LIGHT_COPY, values merged into a returned
+  session stay aliased to the service's scoped state, by design.
+  """
+  if is_feature_enabled(FeatureName.IN_MEMORY_SESSION_SERVICE_LIGHT_COPY):
+    return dict(state)
+  return copy.deepcopy(state)
+
+
 class InMemorySessionService(BaseSessionService):
     """An in-memory implementation of the session service.
 
@@ -150,6 +162,131 @@ class InMemorySessionService(BaseSessionService):
             self.sessions[app_name][user_id] = {}
         self.sessions[app_name][user_id][session_id] = session
 
+    copied_session = _copy_session(session)
+    return self._merge_state(app_name, user_id, copied_session)
+
+  @override
+  async def get_session(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      session_id: str,
+      config: Optional[GetSessionConfig] = None,
+  ) -> Optional[Session]:
+    return self._get_session_impl(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=session_id,
+        config=config,
+    )
+
+  def get_session_sync(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      session_id: str,
+      config: Optional[GetSessionConfig] = None,
+  ) -> Optional[Session]:
+    logger.warning('Deprecated. Please migrate to the async method.')
+    return self._get_session_impl(
+        app_name=app_name,
+        user_id=user_id,
+        session_id=session_id,
+        config=config,
+    )
+
+  def _get_session_impl(
+      self,
+      *,
+      app_name: str,
+      user_id: str,
+      session_id: str,
+      config: Optional[GetSessionConfig] = None,
+  ) -> Optional[Session]:
+    if app_name not in self.sessions:
+      return None
+    if user_id not in self.sessions[app_name]:
+      return None
+    if session_id not in self.sessions[app_name][user_id]:
+      return None
+
+    session = self.sessions[app_name][user_id][session_id]
+    copied_session = _copy_session(session)
+
+    if config:
+      if config.num_recent_events is not None:
+        if config.num_recent_events == 0:
+          copied_session.events = []
+        else:
+          copied_session.events = copied_session.events[
+              -config.num_recent_events :
+          ]
+      if config.after_timestamp:
+        i = len(copied_session.events) - 1
+        while i >= 0:
+          if copied_session.events[i].timestamp < config.after_timestamp:
+            break
+          i -= 1
+        if i >= 0:
+          copied_session.events = copied_session.events[i + 1 :]
+
+    # Return a copy of the session object with merged state.
+    return self._merge_state(app_name, user_id, copied_session)
+
+  def _merge_state(
+      self, app_name: str, user_id: str, copied_session: Session
+  ) -> Session:
+    """Merges app and user state into session state."""
+    # Merge app state
+    if app_name in self.app_state:
+      for key, value in _copy_state(self.app_state[app_name]).items():
+        copied_session.state[State.APP_PREFIX + key] = value
+
+    if (
+        app_name not in self.user_state
+        or user_id not in self.user_state[app_name]
+    ):
+      return copied_session
+
+    # Merge session state with user state.
+    for key, value in _copy_state(self.user_state[app_name][user_id]).items():
+      copied_session.state[State.USER_PREFIX + key] = value
+    return copied_session
+
+  @override
+  async def list_sessions(
+      self, *, app_name: str, user_id: Optional[str] = None
+  ) -> ListSessionsResponse:
+    return self._list_sessions_impl(app_name=app_name, user_id=user_id)
+
+  def list_sessions_sync(
+      self, *, app_name: str, user_id: Optional[str] = None
+  ) -> ListSessionsResponse:
+    logger.warning('Deprecated. Please migrate to the async method.')
+    return self._list_sessions_impl(app_name=app_name, user_id=user_id)
+
+  def _list_sessions_impl(
+      self, *, app_name: str, user_id: Optional[str] = None
+  ) -> ListSessionsResponse:
+    empty_response = ListSessionsResponse()
+    if app_name not in self.sessions:
+      return empty_response
+    if user_id is not None and user_id not in self.sessions[app_name]:
+      return empty_response
+
+    sessions_without_events = []
+
+    if user_id is None:
+      for uid in list(self.sessions[app_name].keys()):
+        for session in list(self.sessions[app_name][uid].values()):
+          copied_session = _copy_session(session)
+          copied_session.events = []
+          copied_session = self._merge_state(app_name, uid, copied_session)
+          sessions_without_events.append(copied_session)
+    else:
+      for session in list(self.sessions[app_name][user_id].values()):
         copied_session = _copy_session(session)
         return self._merge_state(app_name, user_id, copied_session)
 
@@ -300,12 +437,61 @@ class InMemorySessionService(BaseSessionService):
             app_name=app_name, user_id=user_id, session_id=session_id
         )
 
-    def delete_session_sync(
-        self, *, app_name: str, user_id: str, session_id: str
-    ) -> None:
-        logger.warning("Deprecated. Please migrate to the async method.")
-        self._delete_session_impl(
-            app_name=app_name, user_id=user_id, session_id=session_id
+    self.sessions[app_name][user_id].pop(session_id)
+
+  @override
+  async def get_user_state(
+      self, *, app_name: str, user_id: str
+  ) -> dict[str, Any]:
+    user_state = self.user_state.get(app_name, {}).get(user_id, {})
+    return _copy_state(user_state)
+
+  @override
+  async def append_event(self, session: Session, event: Event) -> Event:
+    if event.partial:
+      return event
+
+    app_name = session.app_name
+    user_id = session.user_id
+    session_id = session.id
+
+    if session_id not in self.sessions.get(app_name, {}).get(user_id, {}):
+      raise SessionNotFoundError(f'Session {session_id} not found.')
+
+    # Fetch the canonical storage session early so we can drop a re-delivered
+    # event before modifying any state. The same event can be delivered more
+    # than once when the orchestrator broadcasts a shared-state delta to
+    # several concurrent session references; deduplicating here prevents
+    # double-application of state updates and duplicate entries in event lists.
+    # A re-delivery is an equal event -- the same object, or a copy carrying
+    # the same id and fields -- so dedupe on equality, gated on a matching id
+    # for speed. Distinct events that merely share an id (e.g. tests that
+    # stamp a fixed uuid) are not equal and are kept.
+    storage_session = self.sessions[app_name][user_id][session_id]
+    if any(e == event for e in storage_session.events if e.id == event.id):
+      return event
+
+    # Update the in-memory session.
+    await super().append_event(session=session, event=event)
+    session.last_update_time = event.timestamp
+
+    # Update the storage session if the caller holds a stale copy.
+    if storage_session is not session:
+      storage_session.events.append(event)
+      storage_session.last_update_time = event.timestamp
+
+    if event.actions and event.actions.state_delta:
+      state_deltas = _session_util.extract_state_delta(
+          event.actions.state_delta
+      )
+      app_state_delta = state_deltas['app']
+      user_state_delta = state_deltas['user']
+      session_state_delta = state_deltas['session']
+      if app_state_delta:
+        self.app_state.setdefault(app_name, {}).update(app_state_delta)
+      if user_state_delta:
+        self.user_state.setdefault(app_name, {}).setdefault(user_id, {}).update(
+            user_state_delta
         )
 
     def _delete_session_impl(

@@ -45,10 +45,109 @@ from .utils import envs
 from .utils import evals
 from .utils import logs
 
+if TYPE_CHECKING:
+  from fastapi import FastAPI
+  from google.genai import types
+
+  from ..agents.llm_agent import LlmAgent
+
+
 LOG_LEVELS = click.Choice(
     ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
     case_sensitive=False,
 )
+
+_STREAMING_MODE_CHOICES = tuple(str(mode.value) for mode in StreamingMode)
+
+
+def _missing_eval_dependencies_message() -> str:
+  # Imported lazily so loading the CLI does not pull in the evaluation stack.
+  from ..evaluation.constants import MISSING_EVAL_DEPENDENCIES_MESSAGE
+
+  return MISSING_EVAL_DEPENDENCIES_MESSAGE
+
+
+def _parse_streaming_mode(
+    _ctx: click.Context,
+    param: click.Parameter,
+    value: str | None,
+) -> StreamingMode | None:
+  """Converts a validated CLI value to its streaming mode."""
+  if value is None:
+    return None
+
+  mode = next(
+      (m for m in StreamingMode if str(m.value).lower() == value.lower()), None
+  )
+  if mode is None:
+    raise click.BadParameter(f"unknown streaming mode {value!r}", param=param)
+  return mode
+
+
+def _parse_avatar_config(
+    _ctx: click.Context,
+    param: click.Parameter,
+    value: str | None,
+) -> types.AvatarConfig | None:
+  """Parses an inline JSON object or JSON file into an avatar config."""
+  if value is None:
+    return None
+
+  if value.lstrip().startswith("{"):
+    config_json = value
+  else:
+    try:
+      config_json = Path(value).read_text(encoding="utf-8")
+    except OSError as exc:
+      raise click.BadParameter(
+          f"could not read avatar configuration file {value!r}: {exc}",
+          param=param,
+      ) from exc
+
+  from google.genai import types
+
+  try:
+    return types.AvatarConfig.model_validate_json(config_json)
+  except ValueError as exc:
+    raise click.BadParameter(
+        f"avatar configuration must be a valid AvatarConfig JSON object: {exc}",
+        param=param,
+    ) from exc
+
+
+def _logging_options():
+  """Decorator to add logging options to click commands."""
+
+  def decorator(func):
+    @click.option(
+        "-v",
+        "--verbose",
+        is_flag=True,
+        show_default=True,
+        default=False,
+        help="Enable verbose (DEBUG) logging. Shortcut for --log_level DEBUG.",
+    )
+    @click.option(
+        "--log_level",
+        type=LOG_LEVELS,
+        default="INFO",
+        help="Optional. Set the logging level",
+    )
+    @functools.wraps(func)
+    @click.pass_context
+    def wrapper(ctx, *args, **kwargs):
+      # If verbose flag is set and log level is not set, set log level to DEBUG.
+      log_level_source = ctx.get_parameter_source("log_level")
+      if (
+          kwargs.pop("verbose", False)
+          and log_level_source == ParameterSource.DEFAULT
+      ):
+        kwargs["log_level"] = "DEBUG"
+      return func(*args, **kwargs)
+
+    return wrapper
+
+  return decorator
 
 
 def _apply_feature_overrides(
@@ -538,8 +637,9 @@ def adk_services_options(*, default_use_local_storage: bool = True):
             If set, ADK uses this service.
 
             \b
-            If unset, ADK chooses a default session service (see
-            --use_local_storage).
+            If unset, ADK automatically connects to Agent Platform Sessions when
+            an Agent Platform environment is detected. Otherwise, it chooses a
+            default session service (see --use_local_storage).
             - Use 'agentengine://<agent_engine>' to connect to Agent Engine
               sessions. <agent_engine> can either be the full qualified resource
               name 'projects/abc/locations/us-central1/reasoningEngines/123' or
@@ -563,33 +663,39 @@ def adk_services_options(*, default_use_local_storage: bool = True):
             - Use 'gs://<bucket_name>' to connect to the GCS artifact service.
             - Use 'memory://' to force the in-memory artifact service.
             - Use 'file://<path>' to store artifacts in a custom local directory."""
-            ),
-            default=None,
-        )
-        @click.option(
-            "--use_local_storage/--no_use_local_storage",
-            default=default_use_local_storage,
-            show_default=True,
-            help=(
-                "Optional. Whether to use local .adk storage when "
-                "--session_service_uri and --artifact_service_uri are unset. "
-                "Cannot be combined with explicit service URIs. When the agents "
-                "directory isn't writable (common in Cloud Run/Kubernetes), ADK "
-                "falls back to in-memory unless overridden by "
-                "ADK_FORCE_LOCAL_STORAGE=1 or ADK_DISABLE_LOCAL_STORAGE=1."
-            ),
-        )
-        @click.option(
-            "--memory_service_uri",
-            type=str,
-            help=textwrap.dedent("""\
-            \b
+        ),
+        default=None,
+    )
+    @click.option(
+        "--use_local_storage/--no_use_local_storage",
+        default=default_use_local_storage,
+        show_default=True,
+        help=(
+            "Optional. Whether to use local .adk storage when explicit service"
+            " URIs are unset, and an Agent Platform environment is not"
+            " detected. Cannot be combined with explicit service URIs. When the"
+            " agents directory isn't writable (common in Cloud Run/Kubernetes),"
+            " ADK falls back to in-memory unless overridden by"
+            " ADK_FORCE_LOCAL_STORAGE=1 or ADK_DISABLE_LOCAL_STORAGE=1."
+        ),
+    )
+    @click.option(
+        "--memory_service_uri",
+        type=str,
+        help=textwrap.dedent("""\
             Optional. The URI of the memory service.
+            If set, ADK uses this service.
+
+            \b
+            If unset, ADK automatically connects to Agent Platform Memory Bank
+            when an Agent Platform environment is detected. Otherwise, it uses
+            the default memory service.
             - Use 'rag://<rag_corpus_id>' to connect to Vertex AI Rag Memory Service.
             - Use 'agentengine://<agent_engine>' to connect to Agent Engine
               sessions. <agent_engine> can either be the full qualified resource
               name 'projects/abc/locations/us-central1/reasoningEngines/123' or
               the resource id '123'.
+            - Use 'sqlite:///<relative_path>' / 'sqlite:////<absolute_path>' to connect to SQLite memory service.
             - Use 'memory://' to force the in-memory memory service."""),
             default=None,
         )
@@ -1479,7 +1585,147 @@ def fast_api_common_options():
             ):
                 kwargs["log_level"] = "DEBUG"
 
-            return func(*args, **kwargs)
+    @click.option(
+        "--host",
+        type=str,
+        help="Optional. The binding host of the server",
+        default="127.0.0.1",
+        show_default=True,
+    )
+    @click.option(
+        "--port",
+        type=int,
+        help="Optional. The port of the server",
+        default=8000,
+    )
+    @click.option(
+        "--allow_origins",
+        help=(
+            "Optional. Origins to allow for CORS. Can be literal origins"
+            " (e.g., 'https://example.com') or regex patterns prefixed with"
+            " 'regex:' (e.g., 'regex:https://.*\\.example\\.com')."
+        ),
+        multiple=True,
+    )
+    @click.option(
+        "--trace_to_cloud",
+        is_flag=True,
+        show_default=True,
+        default=False,
+        help="Optional. Whether to enable cloud trace for telemetry.",
+    )
+    @click.option(
+        "--otel_to_cloud",
+        is_flag=True,
+        show_default=True,
+        default=False,
+        help=(
+            "Optional. Whether to write OTel data to Google Cloud"
+            " Observability services - Cloud Trace and Cloud Logging."
+        ),
+    )
+    @click.option(
+        "--reload/--no-reload",
+        default=True,
+        help=(
+            "Optional. Whether to enable auto reload for server. Not supported"
+            " for Cloud Run."
+        ),
+    )
+    @click.option(
+        "--a2a",
+        is_flag=True,
+        show_default=True,
+        default=False,
+        help="Optional. Whether to enable A2A endpoint.",
+    )
+    @click.option(
+        "--reload_agents",
+        is_flag=True,
+        default=False,
+        show_default=True,
+        help="Optional. Whether to enable live reload for agents changes.",
+    )
+    @click.option(
+        "--eval_storage_uri",
+        type=str,
+        help=(
+            "Optional. The evals storage URI to store agent evals,"
+            " supported URIs: gs://<bucket name>."
+        ),
+        default=None,
+    )
+    @click.option(
+        "--extra_plugins",
+        help=(
+            "Optional. Comma-separated list of extra plugin classes or"
+            " instances to enable (e.g., my.module.MyPluginClass or"
+            " my.module.my_plugin_instance)."
+        ),
+        multiple=True,
+    )
+    @click.option(
+        "--url_prefix",
+        type=str,
+        help=(
+            "Optional. URL path prefix when the application is mounted behind a"
+            " reverse proxy or API gateway (e.g., '/api/v1', '/adk'). This"
+            " ensures generated URLs and redirects work correctly when the app"
+            " is not served at the root path. Must start with '/' if provided."
+        ),
+        default=None,
+    )
+    @click.option(
+        "--avatar_config",
+        type=str,
+        callback=_parse_avatar_config,
+        help=(
+            "Optional. AvatarConfig as an inline JSON object or a path to a"
+            " JSON file. Applied to live sessions."
+        ),
+        default=None,
+    )
+    # Parsed into list[str] by the wrapper below (server commands need a list).
+    @click.option(
+        "--trigger_sources",
+        type=str,
+        help=(
+            "Optional. Comma-separated list of trigger sources to enable"
+            " (e.g., 'pubsub,eventarc'). Registers /apps/{app_name}/trigger/*"
+            " endpoints for batch and event-driven agent invocations."
+        ),
+        default=None,
+    )
+    @click.option(
+        "--trigger_oidc_audience",
+        type=str,
+        help=(
+            "Optional. Expected audience for Google-signed OIDC bearer tokens"
+            " on /apps/{app_name}/trigger/* endpoints. When set, requests"
+            " without a valid token matching this audience are rejected with"
+            " 401."
+        ),
+        default=None,
+    )
+    @click.option(
+        "--trigger_oidc_service_accounts",
+        type=str,
+        help=(
+            "Optional. Comma-separated list of allowed service account emails"
+            " for Google-signed OIDC tokens on /apps/{app_name}/trigger/*"
+            " endpoints. Requires --trigger_oidc_audience."
+        ),
+        default=None,
+    )
+    @functools.wraps(func)
+    @click.pass_context
+    def wrapper(ctx, *args, **kwargs):
+      # Parse comma-separated trigger_sources into a list.
+      trigger_sources = kwargs.get("trigger_sources")
+      if trigger_sources is not None:
+        kwargs["trigger_sources"] = [
+            s.strip() for s in trigger_sources.split(",") if s.strip()
+        ]
 
         return wrapper
 
@@ -1518,9 +1764,13 @@ def cli_web(
     artifact_storage_uri: Optional[str] = None,  # Deprecated
     a2a: bool = False,
     reload_agents: bool = False,
-    extra_plugins: Optional[list[str]] = None,
-    logo_text: Optional[str] = None,
-    logo_image_url: Optional[str] = None,
+    extra_plugins: list[str] | None = None,
+    logo_text: str | None = None,
+    logo_image_url: str | None = None,
+    trigger_sources: list[str] | None = None,
+    trigger_oidc_audience: str | None = None,
+    trigger_oidc_service_accounts: list[str] | None = None,
+    avatar_config: types.AvatarConfig | None = None,
 ):
     """Starts a FastAPI server with Web UI for agents.
 
@@ -1585,8 +1835,46 @@ def cli_web(
         reload=reload,
     )
 
-    server = uvicorn.Server(config)
-    server.run()
+  import uvicorn
+
+  from .fast_api import get_fast_api_app
+
+  app = get_fast_api_app(
+      agents_dir=agents_dir,
+      session_service_uri=session_service_uri,
+      artifact_service_uri=artifact_service_uri,
+      memory_service_uri=memory_service_uri,
+      use_local_storage=use_local_storage,
+      eval_storage_uri=eval_storage_uri,
+      allow_origins=allow_origins,
+      web=True,
+      trace_to_cloud=trace_to_cloud,
+      otel_to_cloud=otel_to_cloud,
+      lifespan=_lifespan,
+      a2a=a2a,
+      host=host,
+      bind_host=host,
+      port=port,
+      url_prefix=url_prefix,
+      reload_agents=reload_agents,
+      extra_plugins=extra_plugins,
+      logo_text=logo_text,
+      logo_image_url=logo_image_url,
+      trigger_sources=trigger_sources,
+      trigger_oidc_audience=trigger_oidc_audience,
+      trigger_oidc_service_accounts=trigger_oidc_service_accounts,
+      default_llm_model=default_llm_model,
+      avatar_config=avatar_config,
+  )
+  config = uvicorn.Config(
+      app,
+      host=host,
+      port=port,
+      reload=reload,
+  )
+
+  server = uvicorn.Server(config)
+  server.run()
 
 
 @main.command("api_server")
@@ -1632,6 +1920,13 @@ def cli_api_server(
     reload_agents: bool = False,
     extra_plugins: Optional[list[str]] = None,
     auto_create_session: bool = False,
+    trigger_sources: list[str] | None = None,
+    with_ui: bool = False,
+    gemini_enterprise_app_name: str | None = None,
+    express_mode: bool = False,
+    trigger_oidc_audience: str | None = None,
+    trigger_oidc_service_accounts: list[str] | None = None,
+    avatar_config: types.AvatarConfig | None = None,
 ):
     """Starts a FastAPI server for agents.
 
@@ -1670,8 +1965,56 @@ def cli_api_server(
         port=port,
         reload=reload,
     )
-    server = uvicorn.Server(config)
-    server.run()
+
+  logs.setup_adk_logger(getattr(logging, log_level.upper()))
+  ctx = click.get_current_context(silent=True)
+
+  from contextlib import asynccontextmanager
+
+  import uvicorn
+
+  from .fast_api import get_fast_api_app
+
+  @asynccontextmanager
+  async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    if ctx:
+      ctx.meta["server_started"] = True
+    yield
+
+  config = uvicorn.Config(
+      get_fast_api_app(
+          agents_dir=agents_dir,
+          session_service_uri=session_service_uri,
+          artifact_service_uri=artifact_service_uri,
+          memory_service_uri=memory_service_uri,
+          use_local_storage=use_local_storage,
+          eval_storage_uri=eval_storage_uri,
+          allow_origins=allow_origins,
+          web=with_ui,
+          trace_to_cloud=trace_to_cloud,
+          otel_to_cloud=otel_to_cloud,
+          a2a=a2a,
+          host=host,
+          bind_host=host,
+          port=port,
+          url_prefix=url_prefix,
+          reload_agents=reload_agents,
+          extra_plugins=extra_plugins,
+          auto_create_session=auto_create_session,
+          trigger_sources=trigger_sources,
+          trigger_oidc_audience=trigger_oidc_audience,
+          trigger_oidc_service_accounts=trigger_oidc_service_accounts,
+          gemini_enterprise_app_name=gemini_enterprise_app_name,
+          express_mode=express_mode,
+          avatar_config=avatar_config,
+          lifespan=_lifespan,
+      ),
+      host=host,
+      port=port,
+      reload=reload,
+  )
+  server = uvicorn.Server(config)
+  server.run()
 
 
 @deploy.command(
@@ -2163,39 +2506,57 @@ def cli_deploy_agent_engine(
       # With Express Mode API Key
       adk deploy agent_engine --api_key=[api_key] my_agent
 
-      \b
-      # With Google Cloud Project and Region
-      adk deploy agent_engine --project=[project] --region=[region]
-        --display_name=[app_name] my_agent
-    """
-    logging.getLogger("vertexai_genai.agentengines").setLevel(logging.INFO)
-    try:
-        if validate_agent_import and skip_agent_import_validation_alias:
-            raise click.UsageError(
-                "Do not pass both --validate-agent-import and"
-                " --skip-agent-import-validation."
-            )
-        cli_deploy.to_agent_engine(
-            agent_folder=agent,
-            project=project,
-            region=region,
-            agent_engine_id=agent_engine_id,
-            trace_to_cloud=trace_to_cloud,
-            otel_to_cloud=otel_to_cloud,
-            api_key=api_key,
-            adk_app_object=adk_app_object,
-            display_name=display_name,
-            description=description,
-            adk_app=adk_app,
-            temp_folder=temp_folder,
-            env_file=env_file,
-            requirements_file=requirements_file,
-            absolutize_imports=absolutize_imports,
-            agent_engine_config_file=agent_engine_config_file,
-            skip_agent_import_validation=not validate_agent_import,
-        )
-    except Exception as e:
-        click.secho(f"Deploy failed: {e}", fg="red", err=True)
+    \b
+    # With Google Cloud Project and Region
+    adk deploy agent_engine --project=[project] --region=[region]
+      --display_name=[app_name] my_agent
+
+    \b
+    # With a private Cloud Build worker pool (VPC-SC / private network)
+    adk deploy agent_engine --project=[project] --region=[region]
+      --worker_pool=projects/[project]/locations/[region]/workerPools/[pool]
+      my_agent
+  """
+  logging.getLogger("vertexai_genai.agentengines").setLevel(logging.INFO)
+  try:
+    if validate_agent_import and skip_agent_import_validation_alias:
+      raise click.UsageError(
+          "Do not pass both --validate-agent-import and"
+          " --skip-agent-import-validation."
+      )
+    from . import cli_deploy
+
+    cli_deploy.to_agent_engine(
+        agent_folder=agent,
+        project=project,
+        region=region,
+        agent_engine_id=agent_engine_id,
+        trace_to_cloud=trace_to_cloud,
+        otel_to_cloud=otel_to_cloud,
+        api_key=api_key,
+        adk_app_object=adk_app_object,
+        display_name=display_name,
+        description=description,
+        adk_app=adk_app,
+        temp_folder=temp_folder,
+        env_file=env_file,
+        requirements_file=requirements_file,
+        absolutize_imports=absolutize_imports,
+        agent_engine_config_file=agent_engine_config_file,
+        skip_agent_import_validation=not validate_agent_import,
+        trigger_sources=trigger_sources,
+        trigger_oidc_audience=trigger_oidc_audience,
+        trigger_oidc_service_accounts=trigger_oidc_service_accounts,
+        artifact_service_uri=artifact_service_uri,
+        memory_service_uri=memory_service_uri,
+        session_service_uri=session_service_uri,
+        adk_version=adk_version,
+        extra_packages=list(extra_packages),
+        worker_pool=worker_pool,
+    )
+  except Exception as e:
+    click.secho(f"Deploy failed: {e}", fg="red", err=True)
+    click.get_current_context().exit(1)
 
 
 @deploy.command("gke")
@@ -2342,30 +2703,36 @@ def cli_deploy_gke(
 
     Example:
 
-      adk deploy gke --project=[project] --region=[region]
-        --cluster_name=[cluster_name] path/to/my_agent
-    """
-    try:
-        _warn_if_with_ui(with_ui)
-        cli_deploy.to_gke(
-            agent_folder=agent,
-            project=project,
-            region=region,
-            cluster_name=cluster_name,
-            service_name=service_name,
-            app_name=app_name,
-            temp_folder=temp_folder,
-            port=port,
-            trace_to_cloud=trace_to_cloud,
-            otel_to_cloud=otel_to_cloud,
-            with_ui=with_ui,
-            log_level=log_level,
-            adk_version=adk_version,
-            service_type=service_type,
-            session_service_uri=session_service_uri,
-            artifact_service_uri=artifact_service_uri,
-            memory_service_uri=memory_service_uri,
-            use_local_storage=use_local_storage,
-        )
-    except Exception as e:
-        click.secho(f"Deploy failed: {e}", fg="red", err=True)
+    adk deploy gke --project=[project] --region=[region]
+      --cluster_name=[cluster_name] path/to/my_agent
+  """
+  try:
+    _warn_if_with_ui(with_ui)
+    from . import cli_deploy
+
+    cli_deploy.to_gke(
+        agent_folder=agent,
+        project=project,
+        region=region,
+        cluster_name=cluster_name,
+        service_name=service_name,
+        app_name=app_name,
+        temp_folder=temp_folder,
+        port=port,
+        trace_to_cloud=trace_to_cloud,
+        otel_to_cloud=otel_to_cloud,
+        with_ui=with_ui,
+        log_level=log_level,
+        adk_version=adk_version,
+        service_type=service_type,
+        session_service_uri=session_service_uri,
+        artifact_service_uri=artifact_service_uri,
+        memory_service_uri=memory_service_uri,
+        use_local_storage=use_local_storage,
+        trigger_sources=trigger_sources,
+        trigger_oidc_audience=trigger_oidc_audience,
+        trigger_oidc_service_accounts=trigger_oidc_service_accounts,
+    )
+  except Exception as e:
+    click.secho(f"Deploy failed: {e}", fg="red", err=True)
+    click.get_current_context().exit(1)

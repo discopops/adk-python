@@ -28,8 +28,14 @@ from typing import Union
 
 from google.genai import types
 from google.genai.errors import ClientError
+from pydantic import ConfigDict
+from pydantic import Field
 from typing_extensions import override
 
+from google import genai
+
+from ..utils._event_loop_cache import PerLoopCachedProperty
+from ..utils._gcp_metadata import get_gcp_client_defaults
 from ..utils._google_client_headers import get_tracking_headers
 from ..utils._google_client_headers import merge_tracking_headers
 from ..utils.context_utils import Aclosing
@@ -89,15 +95,73 @@ class Gemini(BaseLlm):
         invocation.
     """
 
-    model: str = "gemini-2.5-flash"
+  Customizing the underlying Client:
+    To set ``google.genai.Client`` options ADK doesn't expose as fields
+    directly (location, project, credentials, http_options, etc.), pass them
+    in ``client_kwargs``::
 
-    base_url: Optional[str] = None
-    """The base URL for the AI platform service endpoint."""
+        from google.adk.models import Gemini
 
-    speech_config: Optional[types.SpeechConfig] = None
+        agent = Agent(
+            model=Gemini(
+                model="gemini-3-pro-preview",
+                client_kwargs={"enterprise": True, "location": "global"},
+            )
+        )
 
-    use_interactions_api: bool = False
-    """Whether to use the interactions API for model invocation.
+    They are applied to every client this model builds, so the client stays
+    one per event loop. Overriding the ``api_client`` property instead pins a
+    single client to the model for its lifetime, which reaches into a closed
+    loop as soon as a second loop uses the model.
+  """
+
+  # Pydantic exempts functools.cached_property by module name rather than by
+  # type, so the descriptor behind the per-loop clients has to be named here to
+  # be read as a descriptor rather than as an undeclared field.
+  model_config = ConfigDict(ignored_types=(PerLoopCachedProperty,))
+
+  model: str = 'gemini-2.5-flash'
+
+  client: Optional[genai.Client] = Field(default=None, exclude=True)
+  """An optional pre-configured google-genai Client.
+
+  When provided, this client will be used for all API calls instead of
+  constructing a new one from environment variables or other attributes.
+  """
+
+  client_kwargs: Optional[dict[str, Any]] = Field(
+      default=None, exclude=True, repr=False
+  )
+  """Extra arguments to pass to the google.genai.Client constructor."""
+
+  base_url: Optional[str] = None
+  """The base URL for the AI platform service endpoint."""
+
+  api_version: Optional[str] = None
+  """The API version to use for the AI platform service endpoint.
+
+  For the Vertex AI backend the google-genai SDK defaults to ``v1beta1``, which
+  exposes the latest preview features. Production deployments that require a
+  stable, SLA-eligible endpoint can set this to ``v1`` to use the GA Vertex AI
+  API. When unset, the ``GOOGLE_GENAI_API_VERSION`` environment variable is
+  consulted, and finally the SDK's own default is used so existing behavior is
+  unchanged.
+
+  An API version embedded in the ``base_url`` path (e.g. a trailing ``/v1``)
+  takes precedence over this field.
+
+  Sample:
+  ```python
+  from google.adk.models import Gemini
+
+  agent = Agent(model=Gemini(model="gemini-2.5-pro", api_version="v1"))
+  ```
+  """
+
+  speech_config: Optional[types.SpeechConfig] = None
+
+  use_interactions_api: bool = False
+  """Whether to use the interactions API for model invocation.
 
   When enabled, uses the interactions API (client.aio.interactions.create())
   instead of the traditional generate_content API. The interactions API
@@ -356,11 +420,187 @@ class Gemini(BaseLlm):
 
         base_url = self.base_url
 
-        kwargs: dict[str, Any] = {
-            "http_options": types.HttpOptions(
-                headers=self._tracking_headers(),
-                api_version=self._live_api_version,
-                base_url=base_url,
+    The interactions API provides stateful conversation capabilities. When
+    previous_interaction_id is set in the request, the API chains interactions
+    instead of requiring full conversation history.
+
+    Note: Context caching is not used with the Interactions API since it
+    maintains conversation state via previous_interaction_id.
+
+    Args:
+      llm_request: The LLM request to send.
+      stream: Whether to stream the response.
+
+    Yields:
+      LlmResponse objects converted from interaction responses.
+    """
+    from .interactions_utils import generate_content_via_interactions
+
+    async for llm_response in generate_content_via_interactions(
+        api_client=self.api_client,
+        llm_request=llm_request,
+        stream=stream,
+        service_tier=llm_request.service_tier,
+    ):
+      yield llm_response
+
+  @property
+  @override
+  def capabilities(self) -> LlmCapabilities:
+    # Declared here rather than inherited from BaseLlm: the base implementation
+    # is a deprecated fallback that warns and will be removed, whereas this is
+    # Gemini's permanent self-report.
+    return LlmCapabilities(
+        output_schema_and_tools=gemini_output_schema_and_tools(self.model),
+    )
+
+  @PerLoopCachedProperty
+  def api_client(self) -> Client:
+    """Provides the api client.
+
+    Returns:
+      The api client.
+    """
+    if self.client:
+      return self.client
+
+    from google.genai import Client
+
+    base_url, api_version = self._base_url_and_api_version
+    if api_version is None:
+      api_version = self._configured_api_version()
+    kwargs_for_http_options: dict[str, Any] = {
+        'headers': self._tracking_headers(),
+        'retry_options': self.retry_options,
+        'base_url': base_url,
+    }
+    if api_version:
+      kwargs_for_http_options['api_version'] = api_version
+
+    kwargs: dict[str, Any] = {
+        'http_options': types.HttpOptions(**kwargs_for_http_options),
+    }
+    if self.model.startswith('projects/'):
+      kwargs['enterprise'] = True
+
+    client_kwargs = getattr(self, 'client_kwargs', None)
+    if not self.model.startswith('projects/'):
+      kwargs.update(get_gcp_client_defaults(client_kwargs))
+    if client_kwargs:
+      kwargs.update(client_kwargs)
+
+    return Client(**kwargs)
+
+  @cached_property
+  def _api_backend(self) -> GoogleLLMVariant:
+    return (
+        GoogleLLMVariant.VERTEX_AI
+        if self.api_client.vertexai
+        else GoogleLLMVariant.GEMINI_API
+    )
+
+  def _tracking_headers(self) -> dict[str, str]:
+    return get_tracking_headers()
+
+  def _configured_api_version(self) -> Optional[str]:
+    """Returns the explicitly configured API version, if any.
+
+    Resolution order:
+      1. The ``api_version`` field set on this instance.
+      2. The ``GOOGLE_GENAI_API_VERSION`` environment variable.
+
+    Returns ``None`` when neither is set, in which case the google-genai SDK's
+    own default (``v1beta1`` for Vertex AI) applies, preserving existing
+    behavior.
+    """
+    if self.api_version:
+      return self.api_version
+    return os.environ.get(_API_VERSION_ENV_VARIABLE_NAME) or None
+
+  @cached_property
+  def _base_url_and_api_version(self) -> tuple[Optional[str], Optional[str]]:
+    return _normalize_base_url_and_api_version(self.base_url)
+
+  @cached_property
+  def _live_api_version(self) -> str:
+    _, api_version = self._base_url_and_api_version
+    if api_version:
+      return api_version
+    if self._api_backend == GoogleLLMVariant.VERTEX_AI:
+      # use beta version for vertex api
+      return 'v1beta1'
+    else:
+      # use v1alpha for using API KEY from Google AI Studio
+      return 'v1alpha'
+
+  @PerLoopCachedProperty
+  def _live_api_client(self) -> Client:
+    if self.client:
+      return self.client
+
+    from google.genai import Client
+
+    base_url, _ = self._base_url_and_api_version
+
+    kwargs: dict[str, Any] = {
+        'http_options': types.HttpOptions(
+            headers=self._tracking_headers(),
+            api_version=self._live_api_version,
+            base_url=base_url,
+        )
+    }
+    if self.model.startswith('projects/'):
+      kwargs['enterprise'] = True
+
+    client_kwargs = getattr(self, 'client_kwargs', None)
+    if not self.model.startswith('projects/'):
+      kwargs.update(get_gcp_client_defaults(client_kwargs))
+    if client_kwargs:
+      kwargs.update(client_kwargs)
+
+    return Client(**kwargs)
+
+  @contextlib.asynccontextmanager
+  async def connect(
+      self, llm_request: LlmRequest
+  ) -> AsyncIterator[BaseLlmConnection]:
+    """Connects to the Gemini model and returns an llm connection.
+
+    Args:
+      llm_request: LlmRequest, the request to send to the Gemini model.
+
+    Yields:
+      BaseLlmConnection, the connection to the Gemini model.
+    """
+    # add tracking headers to custom headers and set api_version given
+    # the customized http options will override the one set in the api client
+    # constructor
+    if (
+        llm_request.live_connect_config
+        and llm_request.live_connect_config.http_options
+    ):
+      if not llm_request.live_connect_config.http_options.headers:
+        llm_request.live_connect_config.http_options.headers = {}
+      llm_request.live_connect_config.http_options.headers = (
+          self._merge_tracking_headers(
+              llm_request.live_connect_config.http_options.headers
+          )
+      )
+      llm_request.live_connect_config.http_options.api_version = (
+          self._live_api_version
+      )
+
+    if self.speech_config is not None:
+      llm_request.live_connect_config.speech_config = self.speech_config
+
+    # Assigned unconditionally. With no system instruction the previous
+    # behavior still sent Content(role='system', parts=[Part()]); skipping the
+    # assignment changes what goes on the wire for every live connect.
+    llm_request.live_connect_config.system_instruction = types.Content(
+        role='system',
+        parts=[
+            types.Part.from_text(
+                text=cast(str, llm_request.config.system_instruction)
             )
         }
         if self.model.startswith("projects/"):
